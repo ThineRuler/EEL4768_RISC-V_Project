@@ -1,5 +1,7 @@
 # Phase 2 Documentation
 
+**This directory is a full test of your phase_2 to follow the small changes outlined in phase_3. I built this as a full test harness to help debug your code.**
+
 You will find the documentation and problem descriptions for phase two in `phase_2/documentation/phase_2.pdf`. Be sure to **read all pages** of the PDF. There are four parts to this phase, that break down as follows.
 
 1. ALU
@@ -41,11 +43,45 @@ Icarus and GTK cannot be directly installed through conda. If you have a windows
 
 Both of these solutions will run a linux operating system. If you have issues, please come to my office hours.
 
-# Testing your work
+# Phase 2 grader
 
-**There is no autograder in this repository.** Verifying that your `alu.v`,
-`imm.v`, `rf.v` and `decoder.v` behave correctly is part of the assignment.
-Follow the example testbench outlined in `phase_2/example/` to understand how to write a testbench.
+## Setup
+
+With the conda environment active, install the Verilog rule checker once:
+
+```
+pip install phase_2/source/python-ece552/
+```
+
+## Put your files here
+
+```
+phase_2/submission/
+    alu.v
+    decoder.v
+    imm.v
+    rf.v
+```
+
+## Run it
+
+From the `EEL4768_RISC-V_Project/` folder:
+
+```
+./phase_2/scripts/student_test.sh
+```
+
+Pass a directory to check files kept somewhere other than
+`phase_2/submission/`:
+
+```
+./phase_2/scripts/student_test.sh /path/to/your/verilog
+```
+
+## Reading the output
+
+The script prints each test's score, a total out of 3, and the output of any
+failed test. The full log is saved to `phase_2/output/log.txt`.
 
 ## The example
 

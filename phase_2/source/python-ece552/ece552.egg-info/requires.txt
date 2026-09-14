@@ -1,0 +1,2 @@
+prettyerr==0.0.0
+pyslang==9.1.0
