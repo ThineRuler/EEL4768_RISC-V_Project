@@ -1,9 +1,8 @@
-# run_test.sh output.
-phase_1/results/
-phase_1/output/
+# scripts/student_test.sh output.
+phase_*/output/
 
-# phase_2 has no local checker: the example's build artifacts, and the grading
-# harness itself, which must never reach a student checkout.
+# The example's build artifacts, and the grading harness itself, which must
+# never reach a student checkout.
 phase_2/example/build/
 phase_2/grader/
 
@@ -19,6 +18,7 @@ __pycache__/
 *.pyc
 .claude
 **/submission/*
+!**/submission/.gitkeep
 
 sim
 *.vcd

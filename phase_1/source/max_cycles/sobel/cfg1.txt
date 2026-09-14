@@ -1,0 +1,3 @@
+# the reference needed 46721 instruction(s); budget is
+# max(1000, 110% of that)
+51394

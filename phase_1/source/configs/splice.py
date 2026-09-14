@@ -1,6 +1,6 @@
 """Splice a config `.data` block into a RISC-V source file.
 
-The rule:
+The rule (documented in configs/README.md):
   replace every line from the first line whose stripped text begins with ".data"
   up to, but NOT including, the first line at-or-after it whose stripped text
   begins with ".text".
