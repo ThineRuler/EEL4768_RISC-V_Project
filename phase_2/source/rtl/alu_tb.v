@@ -184,13 +184,13 @@ module alu_tb();
         run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFF, 32'h00000001); // -1 < 1 = 1
         run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'h00000001, 32'hFFFFFFFF); // 1 < -1 = 0
         
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'h00000000, 32'h00000000); // 0 < 0 = 0
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'h00000001, 32'h00000002); // 1 < 2 = 1
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'h00000002, 32'h00000001);
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFE, 32'hFFFFFFFF);
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFF, 32'hFFFFFFFE);
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFF, 32'h00000001);
-        run_test(3'b011, 1'b0, 1'b0, 1'b0, 32'h00000001, 32'hFFFFFFFF);
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'h00000000, 32'h00000000); // 0 < 0 = 0
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'h00000001, 32'h00000002); // 1 < 2 = 1
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'h00000002, 32'h00000001);
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFE, 32'hFFFFFFFF);
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFF, 32'hFFFFFFFE);
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'hFFFFFFFF, 32'h00000001);
+        run_test(3'b010, 1'b0, 1'b0, 1'b0, 32'h00000001, 32'hFFFFFFFF);
         if (local_error > 0) begin
             $display("[SLT FAILURE]");
             local_error = 0;
@@ -198,13 +198,13 @@ module alu_tb();
         
         // ===== SLTU Tests =====
         $display("\n--- SLTU Tests ---");
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'h00000000, 32'h00000000);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'h00000001, 32'h00000002);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'h00000002, 32'h00000001);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFE, 32'hFFFFFFFF);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFF, 32'hFFFFFFFE);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFF, 32'h00000001);
-        run_test(3'b010, 1'b0, 1'b1, 1'b0, 32'h00000001, 32'hFFFFFFFF);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000000, 32'h00000000);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000001, 32'h00000002);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000002, 32'h00000001);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFE, 32'hFFFFFFFF);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFF, 32'hFFFFFFFE);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'hFFFFFFFF, 32'h00000001);
+        run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000001, 32'hFFFFFFFF);
         
         run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000000, 32'h00000000);
         run_test(3'b011, 1'b0, 1'b1, 1'b0, 32'h00000001, 32'h00000002);
