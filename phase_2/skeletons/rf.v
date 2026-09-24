@@ -44,6 +44,7 @@ module rf #(
     // file should remain unchanged at the clock edge.
     //
     // Write register enable, address [0, 31] and input data.
+    input  wire        i_rd_wen,
     input  wire [ 4:0] i_rd_waddr,
     input  wire [31:0] i_rd_wdata
 );

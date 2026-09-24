@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: ece552
-Version: 0.1.0
-Summary: ECE 552 python tools
-Author-email: Kalyan Sriram <kgsriram@wisc.edu>
-Requires-Python: >=3.10
-Requires-Dist: prettyerr==0.0.0
-Requires-Dist: pyslang==9.1.0
