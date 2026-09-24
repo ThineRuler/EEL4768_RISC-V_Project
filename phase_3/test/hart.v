@@ -1,3 +1,6 @@
+// Super Awesome Group
+// Ian Hunter, Arianna Balsamo Uzcategui, David Escobar, Leah Dwyer
+
 `default_nettype none
 `timescale 1ns / 1ps
 
@@ -140,6 +143,7 @@ module hart #(
     // 2. Decoder & Immediate Generator Linking
     // ========================================================================
 
+    // Initializes all the decoder output wires to their default states
     wire        r_legal;
     wire        r_halt;    
      
@@ -243,8 +247,8 @@ module hart #(
     wire [31:0] r_alu_op1;
     wire [31:0] r_alu_op2;
     
-    assign r_alu_op1 = r_op1_sel ? PC : rs1_data; //determines if PC adress or rs1 data is put into alu_op1  
-    assign r_alu_op2 = r_op2_sel ? r_immediate : rs2_data;     //determines if immediate or rs2 data is put into alu_op2       
+    assign r_alu_op1 = r_op1_sel ? PC : rs1_data;           //determines if PC address or rs1 data is put into r_op1  
+    assign r_alu_op2 = r_op2_sel ? r_immediate : rs2_data;  //determines if immediate or rs2 data is put into r_op2
     
     //CONNECTING PORTS
     
@@ -261,7 +265,7 @@ module hart #(
     );
 
     // ========================================================================
-    // [TEAMMATE HOOK 1]: Branch and Jump Logic
+    // Branch and Jump Logic
     // ========================================================================
     // Computes target addresses and whether a branch/jump is taken.
     wire [31:0] branch_target;
@@ -280,7 +284,7 @@ module hart #(
                                     nxt_instruct;
 
     // ========================================================================
-    // [TEAMMATE HOOK 2]: Data Memory Interface & Sub-word Alignment
+    // Data Memory Interface & Sub-word Alignment
     // ========================================================================
     // Checks alignment, forms byte mask, shifts store data, and sign/zero extends loads.
     wire [1:0] mem_byte_offset;
@@ -341,7 +345,7 @@ module hart #(
                                          32'd0;
 
     // ========================================================================
-    // [TEAMMATE HOOK 3]: Writeback Multiplexer
+    // Writeback Multiplexer
     // ========================================================================
     // Selects destination data based on one-hot r_rd_sel:
     // [0] = ALU result
@@ -355,7 +359,7 @@ module hart #(
                                    32'd0;
 
     // ========================================================================
-    // [TEAMMATE HOOK 4]: Retire Interface
+    // Retire Interface
     // ========================================================================
     // Drives cycle-by-cycle retire information for the testbench.
     wire [6:0] inst_opcode;
