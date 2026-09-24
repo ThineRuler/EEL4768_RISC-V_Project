@@ -5,6 +5,7 @@ phase_*/output/
 # never reach a student checkout.
 phase_2/example/build/
 phase_2/grader/
+**/build/
 
 # LaTeX build byproducts; only the .tex and the .pdf are worth shipping.
 *.aux
