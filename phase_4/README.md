@@ -46,6 +46,20 @@ Both of these solutions will run a linux operating system. If you have issues, p
 `alu.v`, `imm.v`, `rf.v` and `decoder.v` behave correctly is part of the assignment.
 Follow the example testbench outlined in `phase_2/example/` to understand how to write a testbench.
 
+## Compilation test
+
+`scripts/check_design.sh` is a script that will allow you to test your design to see if it can compile without errors.
+**It does not tell you if your processor functions or not.**
+It purely exists to tell you if your code can compile and run within Iverilog and the testing harness that is used to grade your design.
+If you pass this, all you know is that you will not lose points because of errors or not following coding rules, you can still lose points for your processor not functioning.
+
+You can simply run this in a linux or mac envirment
+
+```bash scipts/check_design.sh <name> [submission_dir]```
+
+Name is your name, or you can label it "test".
+Submission dir is the location of your code.
+
 ## The example
 
 `phase_2/example/` holds two files:
