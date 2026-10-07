@@ -159,6 +159,8 @@ module hart #(
     always @(posedge i_clk) begin //when clk is HIGH(1) work begins
         if(i_rst) 
             PC <= RESET_ADDR;
+         else if(stall) // when stall =1 then the PC doesnt advance 
+            PC <= PC;
         else
             PC <= next_pc;
     end
@@ -309,6 +311,21 @@ module hart #(
         (inst_opcode == 7'b0100011) | // STORE
         (inst_opcode == 7'b1100011)   // BRANCH
     );
+    
+    // ========================================================================
+    // STALL/HAZARD DETECTION SIGNAL 
+    // ========================================================================
+
+    wire stall;
+    //checks if the instruction in the ID stage depends on the load instruction  in the EX stage
+    assign stall = 
+        ID_EX_valid && ID_EX_dmem_ren && (ID_EX_rd != 5'd0) && 
+        (
+            (rs1_is_read && (r_rs1 == ID_EX_rd)) || //does rs1 read and is it in the same register the load is going to write
+            (rs2_is_read && (r_rs2 == ID_EX_rd)) //does rs2 read and is it in the register the load is going to write
+        );
+        //the "||" mean does either register depend on the load
+
 
     // ========================================================================
     // ID/EX Pipeline Registers
@@ -405,6 +422,49 @@ module hart #(
             ID_EX_halt <= 1'b0;
             ID_EX_rs1_is_read <= 1'b0;
             ID_EX_rs2_is_read <= 1'b0;
+            
+            end else if(stall) begin
+        ID_EX_PC <= 32'd0;
+        ID_EX_next_pc <= 32'd0;
+        ID_EX_instruct <= 32'h00000013;
+        ID_EX_valid <= 1'b0;
+
+        ID_EX_rs1 <= 5'd0;
+        ID_EX_rs2 <= 5'd0;
+        ID_EX_rd <= 5'd0;
+        ID_EX_immediate <= 32'd0;
+
+        ID_EX_rs1_data <= 32'd0;
+        ID_EX_rs2_data <= 32'd0;
+
+        ID_EX_op1_sel <= 1'b0;
+        ID_EX_op2_sel <= 1'b0;
+        ID_EX_alu_opsel <= 3'd0;
+        ID_EX_alu_sub <= 1'b0;
+        ID_EX_alu_unsigned <= 1'b0;
+        ID_EX_alu_arith <= 1'b0;
+
+        ID_EX_branch <= 1'b0;
+        ID_EX_jump <= 1'b0;
+        ID_EX_branch_equal <= 1'b0;
+        ID_EX_branch_unsigned <= 1'b0;
+        ID_EX_branch_invert <= 1'b0;
+
+        ID_EX_dmem_ren <= 1'b0;
+        ID_EX_dmem_wen <= 1'b0;
+        ID_EX_dmem_align <= 2'd0;
+        ID_EX_dmem_memb <= 1'b0;
+        ID_EX_dmem_memh <= 1'b0;
+        ID_EX_dmem_memw <= 1'b0;
+        ID_EX_dmem_memu <= 1'b0;
+
+        ID_EX_rd_sel <= 4'd0;
+        ID_EX_pc_sel <= 1'b0;
+        ID_EX_legal <= 1'b0;
+        ID_EX_halt <= 1'b0;
+        ID_EX_rs1_is_read <= 1'b0;
+        ID_EX_rs2_is_read <= 1'b0;
+
         end else begin
             //Normal latching of the Decoder & RF outputs
             ID_EX_PC <= IF_ID_PC;
