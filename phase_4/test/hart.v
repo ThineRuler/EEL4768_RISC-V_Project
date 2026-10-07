@@ -181,6 +181,11 @@ module hart #(
             IF_ID_instruct <= 32'h00000013; // NOP instruction
             IF_ID_next_pc <= 32'd0;
             IF_ID_valid <= 1'b0;
+            end else if (stall) begin //stall logic
+            IF_ID_PC <= IF_ID_PC;
+            IF_ID_instruct <= IF_ID_instruct;
+            IF_ID_next_pc <= IF_ID_next_pc;
+            IF_ID_valid <= IF_ID_valid;
         end else begin
             IF_ID_PC <= PC;
             IF_ID_instruct <= i_imem_rdata;
