@@ -51,6 +51,25 @@ Both of these solutions will run a linux operating system. If you have issues, p
 Your testbench also needs a main memory for your caches to talk to.
 Follow the example testbench outlined in `phase_2/example/` to understand how to write a testbench.
 
+## Compilation test
+
+`scripts/check_design.sh` is a script that lets you test your design to see if it can compile without errors.
+**It does not tell you if your processor functions or not.**
+It exists to tell you if your code can compile and run within Iverilog and the testing harness that is used to grade your design.
+It also reports two coding rule violations that the autograder rejects before it runs any test: a banned preprocessor directive (`` `include ``, `` `ifndef ``, `` `elsif ``, or any `` `ifdef `` other than `` `ifdef RISCV_FORMAL ``), and a system task such as `$display`.
+If you pass this, all you know is that you will not lose points because of compile errors or those two rules. You can still lose points for breaking the other coding rules, or for your processor not functioning.
+
+You can run this in a Linux or macOS environment:
+
+```
+bash scripts/check_design.sh <name> <submission_dir>
+```
+
+Name is your name, or you can label it "test".
+Submission dir is the location of your code. Only the `.v` files directly inside it are compiled, the same files the grader compiles.
+
+If everything passes, the script prints `Your design compiled successfully.` Otherwise, it prints every problem it found.
+
 ## The example
 
 `phase_2/example/` holds two files:
