@@ -525,7 +525,29 @@ module hart #(
     wire [31:0] r_alu_op1;
     wire [31:0] r_alu_op2;
     
-    assign r_alu_op1 = ID_EX_op1_sel ? ID_EX_PC : ID_EX_rs1_data;           //determines if PC address or rs1 data is put into r_op1  
+    wire [31:0] r_forward_rs1;
+    wire [31:0] r_forward_rs2;
+    wire [31:0] r_exmem_fwd_data;
+
+    assign r_exmem_fwd_data =
+    EX_MEM_rd_sel[0] ? EX_MEM_result :
+    EX_MEM_rd_sel[1] ? EX_MEM_immediate :
+    EX_MEM_rd_sel[2] ? EX_MEM_next_pc :
+                       32'd0;
+
+    assign r_forward_rs1 =
+    (FWD_EN &&
+     ID_EX_rs1 != 5'd0 &&
+     EX_MEM_valid &&
+     EX_MEM_legal &&
+     !EX_MEM_halt &&
+     EX_MEM_rd != 5'd0 &&
+     (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2]) &&
+     (EX_MEM_rd == ID_EX_rs1))
+    ? r_exmem_fwd_data
+    : ID_EX_rs1_data;
+
+   assign r_alu_op1 = ID_EX_op1_sel ? ID_EX_PC : r_forward_rs1;  
     assign r_alu_op2 = ID_EX_op2_sel ? ID_EX_immediate : ID_EX_rs2_data;  //determines if immediate or rs2 data is put into r_op2
     
     //CONNECTING PORTS
