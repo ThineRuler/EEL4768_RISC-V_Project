@@ -3,7 +3,7 @@
 module hart #(
     // After reset, the program counter (PC) should be initialized to this
     // address and start executing instructions from there.
-    parameter RESET_ADDR = 32'h00000000,
+    parameter RESET_ADDR = 32'h00400000,
     // When set, pipeline forwarding optimizations are enabled.
     parameter FWD_EN = 1,
     // When set, register file bypassing is enabled.
@@ -516,18 +516,113 @@ module hart #(
     end
 
     // ========================================================================
-    // 4. ALU Linking
-    // ========================================================================
-    
-    wire        r_alu_slt;
-    wire        r_alu_eq;
-    wire [31:0] r_result;
-    wire [31:0] r_alu_op1;
-    wire [31:0] r_alu_op2;
-    
-    assign r_alu_op1 = ID_EX_op1_sel ? ID_EX_PC : ID_EX_rs1_data;           //determines if PC address or rs1 data is put into r_op1  
-    assign r_alu_op2 = ID_EX_op2_sel ? ID_EX_immediate : ID_EX_rs2_data;  //determines if immediate or rs2 data is put into r_op2
-    
+// 4. ALU Linking
+// ========================================================================
+
+wire        r_alu_slt;
+wire        r_alu_eq;
+wire [31:0] r_result;
+wire [31:0] r_alu_op1;
+wire [31:0] r_alu_op2;
+
+// Forwarding signals
+wire [31:0] r_forward_rs1;
+wire [31:0] r_forward_rs2;
+wire [31:0] r_exmem_fwd_data;
+wire [31:0] r_memwb_fwd_data;
+wire [31:0] r_store_data;
+
+// ========================================================================
+// EX/MEM Forwarding Data
+// ========================================================================
+// Select the value that would eventually be written to the register file.
+// Loads are intentionally excluded here because their data is not ready
+// until the MEM/WB stage.
+
+assign r_exmem_fwd_data =
+    EX_MEM_rd_sel[0] ? EX_MEM_result :
+    EX_MEM_rd_sel[1] ? EX_MEM_immediate :
+    EX_MEM_rd_sel[2] ? EX_MEM_next_pc :
+                       32'd0;
+
+// ========================================================================
+// Forwarding to ALU operand 1 (rs1)
+// ========================================================================
+
+// Priority:
+// 1. EX/MEM
+// 2. MEM/WB
+// 3. Register-file value
+
+assign r_forward_rs1 =
+    (FWD_EN &&
+     ID_EX_rs1 != 5'd0 &&
+     EX_MEM_valid &&
+     EX_MEM_legal &&
+     !EX_MEM_halt &&
+     EX_MEM_rd != 5'd0 &&
+     (EX_MEM_rd_sel[0] ||
+      EX_MEM_rd_sel[1] ||
+      EX_MEM_rd_sel[2]) &&
+     (EX_MEM_rd == ID_EX_rs1))
+    ? r_exmem_fwd_data :
+
+    (FWD_EN &&
+     ID_EX_rs1 != 5'd0 &&
+     MEM_WB_valid &&
+     !MEM_WB_trap &&
+     !MEM_WB_halt &&
+     MEM_WB_rd != 5'd0 &&
+     (MEM_WB_rd_sel[0] ||
+      MEM_WB_rd_sel[1] ||
+      MEM_WB_rd_sel[2] ||
+      MEM_WB_rd_sel[3]) &&
+     (MEM_WB_rd == ID_EX_rs1))
+    ? r_memwb_fwd_data :
+
+    ID_EX_rs1_data;
+
+// ALU operand 1
+assign r_alu_op1 =
+    ID_EX_op1_sel ? ID_EX_PC : r_forward_rs1;
+
+
+// ========================================================================
+// Forwarding to ALU operand 2 (rs2)
+// ========================================================================
+
+assign r_forward_rs2 =
+    (FWD_EN &&
+     ID_EX_rs2 != 5'd0 &&
+     EX_MEM_valid &&
+     EX_MEM_legal &&
+     !EX_MEM_halt &&
+     EX_MEM_rd != 5'd0 &&
+     (EX_MEM_rd_sel[0] ||
+      EX_MEM_rd_sel[1] ||
+      EX_MEM_rd_sel[2]) &&
+     (EX_MEM_rd == ID_EX_rs2))
+    ? r_exmem_fwd_data :
+
+    (FWD_EN &&
+     ID_EX_rs2 != 5'd0 &&
+     MEM_WB_valid &&
+     !MEM_WB_trap &&
+     !MEM_WB_halt &&
+     MEM_WB_rd != 5'd0 &&
+     (MEM_WB_rd_sel[0] ||
+      MEM_WB_rd_sel[1] ||
+      MEM_WB_rd_sel[2] ||
+      MEM_WB_rd_sel[3]) &&
+     (MEM_WB_rd == ID_EX_rs2))
+    ? r_memwb_fwd_data :
+
+    ID_EX_rs2_data;
+
+// ALU operand 2
+assign r_alu_op2 =
+    ID_EX_op2_sel ? ID_EX_immediate : r_forward_rs2;
+
     //CONNECTING PORTS
     
     alu alu_i(
@@ -639,7 +734,7 @@ module hart #(
             EX_MEM_valid <= ID_EX_valid;
 
             EX_MEM_result <= r_result;
-            EX_MEM_rs2_data <= ID_EX_rs2_data;
+            EX_MEM_rs2_data <= r_forward_rs2;
             EX_MEM_rd <= ID_EX_rd;
             EX_MEM_immediate <= ID_EX_immediate;
 
@@ -657,7 +752,7 @@ module hart #(
             EX_MEM_halt <= ID_EX_halt;
             EX_MEM_rs1 <= ID_EX_rs1;
             EX_MEM_rs2 <= ID_EX_rs2;
-            EX_MEM_rs1_data <= ID_EX_rs1_data;
+            EX_MEM_rs1_data <= r_forward_rs1;
             EX_MEM_rs1_is_read <= ID_EX_rs1_is_read;
             EX_MEM_rs2_is_read <= ID_EX_rs2_is_read;
         end
@@ -698,14 +793,14 @@ module hart #(
                          ) : 4'b0000;
 
     // Store data positioning into active byte lanes
-    assign o_dmem_wdata = EX_MEM_dmem_memw ? EX_MEM_rs2_data :
-                          EX_MEM_dmem_memh ? (mem_byte_offset[1] ? {EX_MEM_rs2_data[15:0], 16'b0} : {16'b0, EX_MEM_rs2_data[15:0]}) :
+    assign o_dmem_wdata = EX_MEM_dmem_memw ? r_store_data :
+                      EX_MEM_dmem_memh ? (mem_byte_offset[1] ? {r_store_data[15:0], 16'b0} : {16'b0, r_store_data[15:0]}) :
                           EX_MEM_dmem_memb ? (
-                              (mem_byte_offset == 2'b00) ? {24'b0, EX_MEM_rs2_data[7:0]} :
-                              (mem_byte_offset == 2'b01) ? {16'b0, EX_MEM_rs2_data[7:0], 8'b0} :
-                              (mem_byte_offset == 2'b10) ? {8'b0, EX_MEM_rs2_data[7:0], 16'b0} :
-                                                           {EX_MEM_rs2_data[7:0], 24'b0}
-                          ) : EX_MEM_rs2_data;
+                              (mem_byte_offset == 2'b00) ? {24'b0, r_store_data[7:0]} :
+                              (mem_byte_offset == 2'b01) ? {16'b0, r_store_data[7:0], 8'b0} :
+                              (mem_byte_offset == 2'b10) ? {8'b0, r_store_data[7:0], 16'b0} :
+                                                           {r_store_data[7:0], 24'b0}
+                          ) : r_store_data;
 
     // Load data byte lane extraction and sign/zero extension
     wire [ 7:0] raw_byte;
@@ -824,18 +919,43 @@ module hart #(
     end
 
     // ========================================================================
-    // Writeback Multiplexer
-    // ========================================================================
-    // Selects destination data based on one-hot r_rd_sel:
-    // [0] = ALU result
-    // [1] = immediate (LUI)
-    // [2] = PC + 4 (JAL / JALR)
-    // [3] = memory load data
-    assign rd_data = MEM_WB_rd_sel[0] ? MEM_WB_result :
-                     MEM_WB_rd_sel[1] ? MEM_WB_immediate :
-                     MEM_WB_rd_sel[2] ? MEM_WB_next_pc :
-                     MEM_WB_rd_sel[3] ? MEM_WB_mem_rdata :
-                                   32'd0;
+// Writeback Multiplexer
+// ========================================================================
+
+// Selects destination data based on one-hot r_rd_sel:
+// [0] = ALU result
+// [1] = immediate (LUI)
+// [2] = PC + 4 (JAL / JALR)
+// [3] = memory load data
+
+assign rd_data = MEM_WB_rd_sel[0] ? MEM_WB_result :
+                 MEM_WB_rd_sel[1] ? MEM_WB_immediate :
+                 MEM_WB_rd_sel[2] ? MEM_WB_next_pc :
+                 MEM_WB_rd_sel[3] ? MEM_WB_mem_rdata :
+                                    32'd0;
+
+// MEM/WB forwarding uses the same final value that is written back.
+assign r_memwb_fwd_data = rd_data;
+
+
+// ========================================================================
+// MEM -> MEM Store Data Forwarding
+// ========================================================================
+
+assign r_store_data =
+    (FWD_EN &&
+     EX_MEM_rs2 != 5'd0 &&
+     MEM_WB_valid &&
+     !MEM_WB_trap &&
+     !MEM_WB_halt &&
+     MEM_WB_rd != 5'd0 &&
+     (MEM_WB_rd_sel[0] ||
+      MEM_WB_rd_sel[1] ||
+      MEM_WB_rd_sel[2] ||
+      MEM_WB_rd_sel[3]) &&
+     (MEM_WB_rd == EX_MEM_rs2))
+    ? r_memwb_fwd_data :
+    EX_MEM_rs2_data;
 
     // ========================================================================
     // Retire Interface
