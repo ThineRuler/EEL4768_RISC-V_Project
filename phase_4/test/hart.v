@@ -159,6 +159,8 @@ module hart #(
     always @(posedge i_clk) begin //when clk is HIGH(1) work begins
         if(i_rst) 
             PC <= RESET_ADDR;
+         else if (flush)
+            PC <= EX_next_pc;
          else if(stall) // when stall =1 then the PC doesnt advance 
             PC <= PC;
         else
@@ -176,7 +178,7 @@ module hart #(
 
     //TODO: Take into account stalls and flushes when implementing the IF/ID pipeline register.
     always @(posedge i_clk) begin
-        if (i_rst) begin
+        if (i_rst || flush) begin
             IF_ID_PC <= 32'd0;
             IF_ID_instruct <= 32'h00000013; // NOP instruction
             IF_ID_next_pc <= 32'd0;
@@ -208,7 +210,7 @@ module hart #(
     wire        r_alu_sub;     
     wire        r_alu_unsigned;     
     wire        r_alu_arith; 
-        
+
     wire        r_branch;     
     wire        r_jump;     
     wire        r_branch_equal;     
@@ -385,7 +387,7 @@ module hart #(
     reg        ID_EX_rs2_is_read;
     
     always @(posedge i_clk) begin
-        if (i_rst) begin
+        if (i_rst || flush) begin
             ID_EX_PC <= 32'd0;
             ID_EX_next_pc <= 32'd0;
             ID_EX_instruct <= 32'h00000013; // NOP instruction
@@ -645,6 +647,7 @@ assign r_alu_op2 =
     wire [31:0] jump_target;
     wire        branch_comp;
     wire        branch_taken;
+    wire        flush;
 
 
     // Since r_result, r_alu_eq, and r_alu_slt are all computed in the EX stage, 
@@ -654,9 +657,10 @@ assign r_alu_op2 =
 
     assign branch_comp   = ID_EX_branch_equal ? r_alu_eq : r_alu_slt;
     assign branch_taken  = ID_EX_branch & (branch_comp ^ ID_EX_branch_invert);
+    assign flush = ID_EX_valid && (ID_EX_jump || branch_taken);
 
     wire [31:0] EX_next_pc;
-    assign next_pc = (ID_EX_jump | branch_taken) ? EX_next_pc : nxt_instruct;
+    assign next_pc = flush ? EX_next_pc : nxt_instruct;
     assign EX_next_pc = ID_EX_jump   ? jump_target :
                         branch_taken ? branch_target :
                                        ID_EX_next_pc;
