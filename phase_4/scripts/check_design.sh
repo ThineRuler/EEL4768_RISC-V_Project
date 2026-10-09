@@ -33,9 +33,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PHASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TRACES="${PHASE_DIR}/source/traces"
-SMOKE_TB="${TRACES}/rtl/hart_smoke_tb.v"
-SMOKE_HEX="${TRACES}/vectors/smoke_program.hex"
+if [[ -f "${SCRIPT_DIR}/hart_smoke_tb.v" && -f "${SCRIPT_DIR}/smoke_program.hex" ]]; then
+    SMOKE_TB="${SCRIPT_DIR}/hart_smoke_tb.v"
+    SMOKE_HEX="${SCRIPT_DIR}/smoke_program.hex"
+else
+    TRACES="${PHASE_DIR}/source/traces"
+    SMOKE_TB="${TRACES}/rtl/hart_smoke_tb.v"
+    SMOKE_HEX="${TRACES}/vectors/smoke_program.hex"
+fi
 
 # The smoke program is 11 words: 10 retire, 1 is skipped by a taken branch.
 # Used only to word the "ended early" error -- a count mismatch on a run
