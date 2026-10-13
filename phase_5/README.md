@@ -6,6 +6,8 @@ You can find the documentation and problem descriptions for phase five in `phase
 
 The skeletons in `phase_5/skeletons/` show the new `hart.v` ports and parameters, and the `cache.v` module header.
 
+> **You will need to re-install the conda environment for this phase.**
+
 # Rubric
 | Category | Points |
 | -------- | -------- |
@@ -51,24 +53,24 @@ Both of these solutions will run a linux operating system. If you have issues, p
 Your testbench also needs a main memory for your caches to talk to.
 Follow the example testbench outlined in `phase_2/example/` to understand how to write a testbench.
 
-## Compilation test
+## Linting
 
-`scripts/check_design.sh` is a script that lets you test your design to see if it can compile without errors.
-**It does not tell you if your processor functions or not.**
-It exists to tell you if your code can compile and run within Iverilog and the testing harness that is used to grade your design.
-It also reports two coding rule violations that the autograder rejects before it runs any test: a banned preprocessor directive (`` `include ``, `` `ifndef ``, `` `elsif ``, or any `` `ifdef `` other than `` `ifdef RISCV_FORMAL ``), and a system task such as `$display`.
-If you pass this, all you know is that you will not lose points because of compile errors or those two rules. You can still lose points for breaking the other coding rules, or for your processor not functioning.
+`lint/` holds a Verilog rule checker that the autograder runs.
+**It only does design checking to see if your design breaks any rules. It does not validate the output or functionality of your design..**
 
-You can run this in a Linux or macOS environment:
+To install it, run the following command from `phase_5/` with the conda environment active.
 
 ```
-bash scripts/check_design.sh <name> <submission_dir>
+pip install ./lint
 ```
 
-Name is your name, or you can label it "test".
-Submission dir is the location of your code. Only the `.v` files directly inside it are compiled, the same files the grader compiles.
+To check your design, run the checker on your files. The `-w` flag treats warnings as errors, as the autograder does.
 
-If everything passes, the script prints `Your design compiled successfully.` Otherwise, it prints every problem it found.
+```
+ece552 validate -w hart.v cache.v alu.v imm.v rf.v decoder.v
+```
+
+If the command prints nothing and exits with code 0, your files pass. Otherwise, each error names the file, the line, and the rule you broke.
 
 ## The example
 
