@@ -3,7 +3,7 @@ channels:
   - defaults
   - conda-forge
 dependencies:
-  - python
+  - python=3.12
   - pip
   - conda-forge::gtkwave
   - conda-forge::iverilog
