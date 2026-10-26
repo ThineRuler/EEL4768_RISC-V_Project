@@ -55,7 +55,532 @@ module cache #(
     output wire [BLOCK_SIZE-1:0]   o_mem_wr_be
 );
 
-// Write your code here.
+// ============================================================================
+// EEL 4768: Computer Architecture - Phase 5 Cache Design
+// Implementation: Parts 1 and 2 (Direct-Mapped, Multi-Way, LRU & PLRU)
+//
+// OVERVIEW AND ARCHITECTURE:
+// --------------------------
+// This module implements a parameterizable L1 cache supporting:
+//  - Direct-Mapped (NUM_WAYS = 1)
+//  - Set-Associative (NUM_WAYS = 2, 4, 8, etc.)
+//  - Fully-Associative (NUM_WAYS = TOTAL_BLOCKS, NUM_SETS = 1)
+//  - Replacement Policies:
+//      * EVICT_POLICY = 0: True LRU (Least Recently Used) via MRU->LRU order list
+//      * EVICT_POLICY = 1: PLRU (Pseudo-LRU) via binary decision tree
+//      * Rule (Section 4.3 & 4.11): The lowest-numbered invalid way is ALWAYS
+//        used before evicting any valid line.
+//  - Write Policy (Section 4.4):
+//      * Store Hit  : Write-back (update cache line, mark dirty, no memory access)
+//      * Store Miss : Write-through, no-allocate (write straight to main memory
+//                     with byte enables; line is NOT brought into the cache)
+//  - Eviction & Miss Policy (Section 4.4.1 & 4.7):
+//      * Clean Eviction : Request new line from memory immediately.
+//      * Dirty Eviction : Write full dirty block back to main memory first
+//                         (all byte enables high), then request new line.
+//      * CPU Handshake  : o_ready stalls the pipeline during memory wait and
+//                         releases once data is ready.
+//
+// ADDRESS DECOMPOSITION (Section 4.5):
+// ------------------------------------
+// A 32-bit byte address is partitioned as follows:
+//  +---------------------------+-------------------+----------------------+
+//  | Tag (TAG_BITS)            | Set (SET_BITS)    | Byte Offset (OFFSET) |
+//  +---------------------------+-------------------+----------------------+
+//  - Byte Offset : OFFSET_BITS = $clog2(BLOCK_SIZE)
+//  - Set Index   : SET_BITS    = $clog2(NUM_SETS) where NUM_SETS = (CACHE_SIZE*1024)/(BLOCK_SIZE*NUM_WAYS)
+//  - Tag         : TAG_BITS    = 32 - SET_BITS - OFFSET_BITS
+//
+// When NUM_SETS == 1 (Fully Associative), SET_BITS is 0, so the address splits
+// purely into Tag and Byte Offset.
+// ============================================================================
+
+    // ------------------------------------------------------------------------
+    // 1. Geometry Calculations & Local Parameters
+    // ------------------------------------------------------------------------
+    localparam TOTAL_BYTES     = CACHE_SIZE * 1024;
+    localparam TOTAL_BLOCKS    = TOTAL_BYTES / BLOCK_SIZE;
+    localparam NUM_SETS        = TOTAL_BLOCKS / NUM_WAYS;
+
+    // Address field widths
+    localparam OFFSET_BITS     = $clog2(BLOCK_SIZE);
+    localparam SET_BITS_RAW    = $clog2(NUM_SETS);
+    // Guard against zero-width index wires when NUM_SETS == 1 (Fully Associative)
+    localparam SET_BITS        = (SET_BITS_RAW > 0) ? SET_BITS_RAW : 1;
+    localparam TAG_BITS        = 32 - SET_BITS_RAW - OFFSET_BITS;
+
+    // Word indexing within a block (each RV32 word is 4 bytes = 32 bits)
+    localparam WORD_BITS       = (OFFSET_BITS > 2) ? (OFFSET_BITS - 2) : 1;
+
+    // Way indexing
+    localparam WAY_BITS_RAW    = $clog2(NUM_WAYS);
+    localparam WAY_BITS        = (WAY_BITS_RAW > 0) ? WAY_BITS_RAW : 1;
+
+    // PLRU tree nodes per set: an N-way binary tree requires N - 1 decision bits
+    localparam PLRU_NODES      = (NUM_WAYS > 1) ? (NUM_WAYS - 1) : 1;
+    localparam NODE_BITS_RAW   = $clog2(PLRU_NODES);
+    localparam NODE_BITS       = (NODE_BITS_RAW > 1) ? NODE_BITS_RAW : 2;
+
+    // ------------------------------------------------------------------------
+    // 2. Address Slicing
+    // ------------------------------------------------------------------------
+    // Byte offset within the block
+    wire [OFFSET_BITS-1:0] req_offset = i_addr[OFFSET_BITS-1:0];
+
+    // Word index within the block (bits [OFFSET_BITS-1:2])
+    wire [WORD_BITS-1:0]   req_word   = (OFFSET_BITS > 2) ? req_offset[OFFSET_BITS-1:2] : 1'b0;
+
+    // Tag from high address bits
+    wire [TAG_BITS-1:0]    req_tag    = i_addr[31 : 32 - TAG_BITS];
+
+    // Set index from middle address bits (constant 0 when Fully Associative)
+    wire [SET_BITS-1:0]    req_set;
+    generate
+        if (NUM_SETS > 1) begin : gen_req_set
+            assign req_set = i_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
+        end else begin : gen_req_set_fa
+            assign req_set = 1'b0;
+        end
+    endgenerate
+
+    // ------------------------------------------------------------------------
+    // 3. Cache Storage Structures
+    // ------------------------------------------------------------------------
+    // For each set and each way:
+    //  - valid : 1 bit indicating the line holds valid data
+    //  - dirty : 1 bit indicating the line has been modified by a store
+    //  - tags  : TAG_BITS tag memory
+    //  - mem   : BLOCK_SIZE * 8 bits data storage
+    reg                    valid [0:NUM_SETS-1][0:NUM_WAYS-1];
+    reg                    dirty [0:NUM_SETS-1][0:NUM_WAYS-1];
+    reg [TAG_BITS-1:0]     tags  [0:NUM_SETS-1][0:NUM_WAYS-1];
+    reg [BLOCK_SIZE*8-1:0] mem   [0:NUM_SETS-1][0:NUM_WAYS-1];
+
+    // ------------------------------------------------------------------------
+    // 4. Parallel Multi-Way Tag Comparison & Hit Logic
+    // ------------------------------------------------------------------------
+    // Check all ways in parallel: hit occurs if valid bit is set and tag matches.
+    wire [NUM_WAYS-1:0] way_hit;
+    genvar gw;
+    generate
+        for (gw = 0; gw < NUM_WAYS; gw = gw + 1) begin : gen_way_hit
+            assign way_hit[gw] = valid[req_set][gw] && (tags[req_set][gw] == req_tag);
+        end
+    endgenerate
+
+    wire hit = |way_hit;
+
+    // Priority encoder to identify hit_way (only one way can hit since tags are unique)
+    wire [WAY_BITS-1:0] hit_way;
+    generate
+        if (NUM_WAYS == 1) begin : gen_hit_way_dm
+            assign hit_way = 1'b0;
+        end else begin : gen_hit_way_mw
+            genvar gb_idx, gw_idx;
+            for (gb_idx = 0; gb_idx < WAY_BITS; gb_idx = gb_idx + 1) begin : gen_hit_bit
+                wire [NUM_WAYS-1:0] bit_matches;
+                for (gw_idx = 0; gw_idx < NUM_WAYS; gw_idx = gw_idx + 1) begin : gen_hit_cand
+                    localparam integer BIT_VAL = (gw_idx >> gb_idx) & 1;
+                    assign bit_matches[gw_idx] = way_hit[gw_idx] && (BIT_VAL == 1);
+                end
+                assign hit_way[gb_idx] = |bit_matches;
+            end
+        end
+    endgenerate
+
+    // Read word extraction from hit way:
+    // Each word is 32 bits = 2^5 bits, so bit offset is {req_word, 5'b00000}.
+    wire [BLOCK_SIZE*8-1:0]  hit_line_data    = mem[req_set][hit_way];
+    wire [OFFSET_BITS+3-1:0] hit_word_bit_idx = {req_word, 5'b00000};
+    wire [31:0]              hit_word         = hit_line_data[hit_word_bit_idx +: 32];
+
+    // ------------------------------------------------------------------------
+    // 5. Victim Selection Logic (on a Miss)
+    // ------------------------------------------------------------------------
+    // Section 4.3 & 4.11 Requirement:
+    // "The lowest-numbered invalid way is always used before evicting a valid one."
+    wire [NUM_WAYS-1:0] way_invalid;
+    genvar giw;
+    generate
+        for (giw = 0; giw < NUM_WAYS; giw = giw + 1) begin : gen_invalid_bits
+            assign way_invalid[giw] = ~valid[req_set][giw];
+        end
+    endgenerate
+
+    wire has_invalid = |way_invalid;
+
+    // Find the first (lowest-numbered) invalid way
+    wire [WAY_BITS-1:0] lowest_invalid_way;
+    generate
+        if (NUM_WAYS == 1) begin : gen_inv_dm
+            assign lowest_invalid_way = 1'b0;
+        end else begin : gen_inv_mw
+            wire [NUM_WAYS-1:0] first_invalid;
+            assign first_invalid[0] = way_invalid[0];
+            for (giw = 1; giw < NUM_WAYS; giw = giw + 1) begin : gen_first_inv
+                assign first_invalid[giw] = way_invalid[giw] && (~|way_invalid[giw-1:0]);
+            end
+
+            genvar gb_i, gw_i;
+            for (gb_i = 0; gb_i < WAY_BITS; gb_i = gb_i + 1) begin : gen_inv_bit
+                wire [NUM_WAYS-1:0] bit_cands;
+                for (gw_i = 0; gw_i < NUM_WAYS; gw_i = gw_i + 1) begin : gen_inv_cand
+                    localparam integer B_VAL = (gw_i >> gb_i) & 1;
+                    assign bit_cands[gw_i] = first_invalid[gw_i] && (B_VAL == 1);
+                end
+                assign lowest_invalid_way[gb_i] = |bit_cands;
+            end
+        end
+    endgenerate
+
+    // Replacement Policy 0: True LRU (Least Recently Used)
+    // Maintains an order list order[s][0..NUM_WAYS-1] per set:
+    //  - order[s][0] is the Most Recently Used (MRU) way.
+    //  - order[s][NUM_WAYS-1] is the Least Recently Used (LRU) way.
+    reg [WAY_BITS-1:0] order [0:NUM_SETS-1][0:NUM_WAYS-1];
+    wire [WAY_BITS-1:0] lru_victim = (NUM_WAYS > 1) ? order[req_set][NUM_WAYS-1] : 1'b0;
+
+    // Replacement Policy 1: PLRU (Pseudo-LRU) Binary Decision Tree
+    // Section 4.3.2 & Figure 1:
+    //  - Bit value 0 points LEFT; bit value 1 points RIGHT.
+    //  - On a miss: Traverses tree without updating to locate victim leaf.
+    //  - On hit or fill: Tree nodes along access path flip to point away from accessed way.
+    reg [PLRU_NODES-1:0] plru_tree [0:NUM_SETS-1];
+    wire [WAY_BITS-1:0]  plru_victim;
+    wire [NODE_BITS-1:0] trav_node [0:WAY_BITS-1];
+
+    genvar gd;
+    generate
+        if (NUM_WAYS <= 1) begin : gen_plru_dm
+            assign plru_victim = 1'b0;
+        end else begin : gen_plru_mw
+            assign trav_node[0] = {NODE_BITS{1'b0}};
+            assign plru_victim[WAY_BITS-1] = plru_tree[req_set][0];
+
+            for (gd = 1; gd < WAY_BITS; gd = gd + 1) begin : gen_trav
+                wire bit_val = plru_tree[req_set][trav_node[gd-1]];
+                assign trav_node[gd] = bit_val ?
+                    ((trav_node[gd-1] << 1) + {{(NODE_BITS-2){1'b0}}, 2'd2}) :
+                    ((trav_node[gd-1] << 1) + {{(NODE_BITS-1){1'b0}}, 1'd1});
+                assign plru_victim[WAY_BITS-1-gd] = plru_tree[req_set][trav_node[gd]];
+            end
+        end
+    endgenerate
+
+    // Overall Victim Selection:
+    // Invalid way always takes precedence over replacement policies!
+    wire [WAY_BITS-1:0] victim_way = has_invalid ? lowest_invalid_way :
+                                     (EVICT_POLICY == 0) ? lru_victim : plru_victim;
+
+    // Check if the chosen victim line is valid and dirty (requires write-back)
+    wire victim_is_dirty = valid[req_set][victim_way] && dirty[req_set][victim_way];
+
+    // ------------------------------------------------------------------------
+    // 6. Next Replacement State Computation (LRU & PLRU)
+    // ------------------------------------------------------------------------
+    // Both policies update when an access finishes:
+    //  1. Read Hit or Store Hit in STATE_IDLE (access to hit_way)
+    //  2. Line Fill in STATE_WAIT_DATA upon i_mem_valid (access to latched_victim_way)
+    wire [SET_BITS-1:0] update_set;
+    wire [WAY_BITS-1:0] update_way;
+    wire                access_update;
+
+    // LRU next order computation:
+    // On access to update_way, update_way moves to slot 0 (MRU).
+    // Slots that were ahead of update_way shift right by 1; slots behind it stay.
+    wire [WAY_BITS-1:0] next_order [0:NUM_SETS-1][0:NUM_WAYS-1];
+    genvar s_g, w_g, p_g;
+    generate
+        for (s_g = 0; s_g < NUM_SETS; s_g = s_g + 1) begin : gen_set_lru
+            if (NUM_WAYS > 1) begin : gen_mw_lru
+                assign next_order[s_g][0] = update_way;
+                for (w_g = 1; w_g < NUM_WAYS; w_g = w_g + 1) begin : gen_lru_slot
+                    wire [w_g-1:0] prefix_matches;
+                    for (p_g = 0; p_g < w_g; p_g = p_g + 1) begin : gen_pfx
+                        assign prefix_matches[p_g] = (order[s_g][p_g] == update_way);
+                    end
+                    wire found_in_pfx = |prefix_matches;
+                    assign next_order[s_g][w_g] = found_in_pfx ? order[s_g][w_g] : order[s_g][w_g-1];
+                end
+            end else begin : gen_dm_lru
+                assign next_order[s_g][0] = 1'b0;
+            end
+        end
+    endgenerate
+
+    // PLRU next tree computation:
+    // Identify nodes on path to update_way and flip each to point AWAY from update_way.
+    wire [NODE_BITS-1:0] upd_node [0:WAY_BITS-1];
+    generate
+        if (NUM_WAYS > 1) begin : gen_upd_nodes
+            assign upd_node[0] = {NODE_BITS{1'b0}};
+            for (gd = 1; gd < WAY_BITS; gd = gd + 1) begin : gen_upd_idx
+                assign upd_node[gd] = update_way[WAY_BITS-gd] ?
+                    ((upd_node[gd-1] << 1) + {{(NODE_BITS-2){1'b0}}, 2'd2}) :
+                    ((upd_node[gd-1] << 1) + {{(NODE_BITS-1){1'b0}}, 1'd1});
+            end
+        end
+    endgenerate
+
+    wire [PLRU_NODES-1:0] next_tree [0:NUM_SETS-1];
+    genvar n_g;
+    generate
+        for (s_g = 0; s_g < NUM_SETS; s_g = s_g + 1) begin : gen_set_plru
+            if (NUM_WAYS > 1) begin : gen_mw_tree
+                for (n_g = 0; n_g < PLRU_NODES; n_g = n_g + 1) begin : gen_node
+                    localparam [NODE_BITS-1:0] NODE_IDX = n_g;
+                    wire [WAY_BITS-1:0] node_matches;
+                    for (gd = 0; gd < WAY_BITS; gd = gd + 1) begin : gen_match
+                        assign node_matches[gd] = (upd_node[gd] == NODE_IDX);
+                    end
+                    wire is_on_path = |node_matches;
+
+                    wire [WAY_BITS-1:0] new_bit_cand;
+                    for (gd = 0; gd < WAY_BITS; gd = gd + 1) begin : gen_cand
+                        assign new_bit_cand[gd] = node_matches[gd] && (~update_way[WAY_BITS-1-gd]);
+                    end
+                    assign next_tree[s_g][n_g] = is_on_path ? (|new_bit_cand) : plru_tree[s_g][n_g];
+                end
+            end else begin : gen_dm_tree
+                assign next_tree[s_g] = 1'b0;
+            end
+        end
+    endgenerate
+
+    // ------------------------------------------------------------------------
+    // 7. Write Data & Byte Enable Generators
+    // ------------------------------------------------------------------------
+    // Store Hit (Write-Back):
+    // Merges store bytes into the hit way's block using i_mask and i_wdata.
+    wire [BLOCK_SIZE*8-1:0] store_hit_updated_line;
+    genvar gb;
+    generate
+        for (gb = 0; gb < BLOCK_SIZE; gb = gb + 1) begin : gen_hit_bytes
+            localparam [WORD_BITS-1:0] GB_WORD = gb / 4;
+            localparam [1:0]           GB_LANE = gb % 4;
+            wire byte_en = (req_word == GB_WORD) && i_mask[GB_LANE];
+            assign store_hit_updated_line[gb*8 +: 8] = byte_en ? i_wdata[GB_LANE*8 +: 8] :
+                                                                  hit_line_data[gb*8 +: 8];
+        end
+    endgenerate
+
+    // Store Miss (Write-Through, No-Allocate):
+    // Places store bytes at the appropriate byte positions within a BLOCK_SIZE line,
+    // and sets byte enables only for the modified bytes.
+    wire [BLOCK_SIZE*8-1:0] store_miss_mem_wr_data;
+    wire [BLOCK_SIZE-1:0]   store_miss_mem_wr_be;
+    generate
+        for (gb = 0; gb < BLOCK_SIZE; gb = gb + 1) begin : gen_sm_bytes
+            localparam [WORD_BITS-1:0] GB_WORD = gb / 4;
+            localparam [1:0]           GB_LANE = gb % 4;
+            wire byte_en = (req_word == GB_WORD) && i_mask[GB_LANE];
+            assign store_miss_mem_wr_be[gb] = byte_en;
+            assign store_miss_mem_wr_data[gb*8 +: 8] = byte_en ? i_wdata[GB_LANE*8 +: 8] : 8'h00;
+        end
+    endgenerate
+
+    // ------------------------------------------------------------------------
+    // 8. FSM States & Miss Registers
+    // ------------------------------------------------------------------------
+    localparam STATE_IDLE      = 2'd0; // Servicing hits or detecting misses
+    localparam STATE_DIRTY_WB  = 2'd1; // Writing back dirty victim block to main memory
+    localparam STATE_READ_REQ  = 2'd2; // Pulsing memory read request for missed line
+    localparam STATE_WAIT_DATA = 2'd3; // Waiting for i_mem_valid from memory
+
+    reg [1:0] state;
+
+    // Registers to latch miss context across memory stall cycles
+    reg [31:0]             latched_addr;
+    reg [WAY_BITS-1:0]     latched_victim_way;
+    reg [TAG_BITS-1:0]     latched_victim_tag;
+    reg [BLOCK_SIZE*8-1:0] latched_victim_data;
+
+    // Sliced fields from latched_addr
+    wire [OFFSET_BITS-1:0] latched_offset = latched_addr[OFFSET_BITS-1:0];
+    wire [WORD_BITS-1:0]   latched_word   = (OFFSET_BITS > 2) ? latched_offset[OFFSET_BITS-1:2] : 1'b0;
+    wire [TAG_BITS-1:0]    latched_tag    = latched_addr[31 : 32 - TAG_BITS];
+
+    wire [SET_BITS-1:0]    latched_set;
+    generate
+        if (NUM_SETS > 1) begin : gen_latched_set
+            assign latched_set = latched_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
+        end else begin : gen_latched_set_fa
+            assign latched_set = 1'b0;
+        end
+    endgenerate
+
+    // Reconstruct memory block address of the evicted dirty line
+    wire [31:0] latched_evict_addr;
+    generate
+        if (NUM_SETS > 1) begin : gen_latched_evict_addr
+            assign latched_evict_addr = {latched_victim_tag, latched_set, {OFFSET_BITS{1'b0}}};
+        end else begin : gen_latched_evict_addr_fa
+            assign latched_evict_addr = {latched_victim_tag, {OFFSET_BITS{1'b0}}};
+        end
+    endgenerate
+
+    // Extract word requested by CPU from memory read response
+    wire [OFFSET_BITS+3-1:0] latched_word_bit_idx = {latched_word, 5'b00000};
+    wire [31:0]              mem_word             = i_mem_rd_data[latched_word_bit_idx +: 32];
+
+    // Replacement update controls
+    assign access_update = (state == STATE_IDLE && (i_ren || i_wen) && hit) ||
+                           (state == STATE_WAIT_DATA && i_mem_valid);
+    assign update_set    = (state == STATE_WAIT_DATA) ? latched_set : req_set;
+    assign update_way    = (state == STATE_WAIT_DATA) ? latched_victim_way : hit_way;
+
+    // ------------------------------------------------------------------------
+    // 9. CPU & Memory Interface Output Assignments
+    // ------------------------------------------------------------------------
+    // CPU Interface:
+    //  - o_ready : High when ready to accept/complete access.
+    //              * In STATE_IDLE: high if no access, if hit, or if store miss (write-through no stall)
+    //              * In STATE_WAIT_DATA: high on the cycle i_mem_valid arrives
+    //              * Otherwise: low (stalls the pipeline)
+    assign o_ready = (state == STATE_IDLE)      ? (!i_ren || hit || i_wen) :
+                     (state == STATE_WAIT_DATA) ? i_mem_valid :
+                     1'b0;
+
+    //  - o_rdata : Multiplexed word returned to CPU.
+    //              * In STATE_WAIT_DATA: word extracted directly from arriving memory line
+    //              * In STATE_IDLE: word extracted from the hit way
+    assign o_rdata = (state == STATE_WAIT_DATA) ? mem_word : hit_word;
+
+    // Memory Line Read Interface:
+    //  - o_mem_rd : 1-cycle pulse requesting a line from memory.
+    //               * Clean miss: issued directly in STATE_IDLE
+    //               * Dirty miss: issued in STATE_READ_REQ (after dirty write-back completes)
+    assign o_mem_rd = (state == STATE_IDLE && i_ren && !hit && !victim_is_dirty) ||
+                      (state == STATE_READ_REQ);
+
+    //  - o_mem_rd_addr : Line-aligned address of requested block
+    assign o_mem_rd_addr = (state == STATE_READ_REQ) ?
+                               {latched_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} :
+                               {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+
+    // Memory Line Write Interface:
+    //  - o_mem_wr : 1-cycle pulse to write a line to memory.
+    //               * Dirty write-back in STATE_DIRTY_WB
+    //               * Store miss write-through in STATE_IDLE
+    assign o_mem_wr = (state == STATE_DIRTY_WB) ||
+                      (state == STATE_IDLE && i_wen && !hit);
+
+    //  - o_mem_wr_addr : Target line address
+    assign o_mem_wr_addr = (state == STATE_DIRTY_WB) ?
+                               latched_evict_addr :
+                               {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+
+    //  - o_mem_wr_data : Block data written to memory
+    assign o_mem_wr_data = (state == STATE_DIRTY_WB) ?
+                               latched_victim_data :
+                               store_miss_mem_wr_data;
+
+    //  - o_mem_wr_be : One bit per byte. All ones for dirty write-back,
+    //                  or selective bytes for write-through.
+    assign o_mem_wr_be = (state == STATE_DIRTY_WB) ?
+                             {BLOCK_SIZE{1'b1}} :
+                             store_miss_mem_wr_be;
+
+    // ------------------------------------------------------------------------
+    // 10. Sequential Logic (Synchronous Single-Clock Reset)
+    // ------------------------------------------------------------------------
+    integer s_idx, w_idx;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            // Synchronous Reset: invalidate all lines, clear dirty bits and FSM
+            state                <= STATE_IDLE;
+            latched_addr         <= 32'd0;
+            latched_victim_way   <= {WAY_BITS{1'b0}};
+            latched_victim_tag   <= {TAG_BITS{1'b0}};
+            latched_victim_data  <= {(BLOCK_SIZE*8){1'b0}};
+
+            for (s_idx = 0; s_idx < NUM_SETS; s_idx = s_idx + 1) begin
+                for (w_idx = 0; w_idx < NUM_WAYS; w_idx = w_idx + 1) begin
+                    valid[s_idx][w_idx] <= 1'b0;
+                    dirty[s_idx][w_idx] <= 1'b0;
+                    tags[s_idx][w_idx]  <= {TAG_BITS{1'b0}};
+                    order[s_idx][w_idx] <= w_idx[WAY_BITS-1:0];
+                end
+                plru_tree[s_idx] <= {PLRU_NODES{1'b0}};
+            end
+        end else begin
+            // ----------------------------------------------------------------
+            // Replacement Policy Updates on Access (Hit or Fill)
+            // ----------------------------------------------------------------
+            if (access_update) begin
+                if (EVICT_POLICY == 0) begin
+                    for (w_idx = 0; w_idx < NUM_WAYS; w_idx = w_idx + 1) begin
+                        order[update_set][w_idx] <= next_order[update_set][w_idx];
+                    end
+                end else begin
+                    plru_tree[update_set] <= next_tree[update_set];
+                end
+            end
+
+            // ----------------------------------------------------------------
+            // Main Cache Controller FSM
+            // ----------------------------------------------------------------
+            case (state)
+                STATE_IDLE: begin
+                    if (i_wen && hit) begin
+                        // Store Hit: Write-back policy
+                        // Update cache line, mark as dirty, no main memory write.
+                        mem[req_set][hit_way]   <= store_hit_updated_line;
+                        dirty[req_set][hit_way] <= 1'b1;
+                        state                   <= STATE_IDLE;
+                    end else if (i_wen && !hit) begin
+                        // Store Miss: Write-through, no-allocate
+                        // Directly forwarded to memory via o_mem_wr; cache unchanged.
+                        state <= STATE_IDLE;
+                    end else if (i_ren && !hit) begin
+                        // Read Miss: Must allocate a block in the set
+                        latched_addr       <= i_addr;
+                        latched_victim_way <= victim_way;
+
+                        if (victim_is_dirty) begin
+                            // Dirty line must be written back to memory first
+                            latched_victim_tag  <= tags[req_set][victim_way];
+                            latched_victim_data <= mem[req_set][victim_way];
+                            state               <= STATE_DIRTY_WB;
+                        end else begin
+                            // Clean line: o_mem_rd is asserted this cycle
+                            state <= STATE_WAIT_DATA;
+                        end
+                    end else begin
+                        // Read hit or Idle: no change
+                        state <= STATE_IDLE;
+                    end
+                end
+
+                STATE_DIRTY_WB: begin
+                    // One-cycle write pulse has been delivered; now issue read request
+                    state <= STATE_READ_REQ;
+                end
+
+                STATE_READ_REQ: begin
+                    // One-cycle read pulse has been delivered; now await memory line
+                    state <= STATE_WAIT_DATA;
+                end
+
+                STATE_WAIT_DATA: begin
+                    if (i_mem_valid) begin
+                        // Requested line has arrived from main memory!
+                        // Store line, set valid, clear dirty, set tag
+                        mem[latched_set][latched_victim_way]   <= i_mem_rd_data;
+                        tags[latched_set][latched_victim_way]  <= latched_tag;
+                        valid[latched_set][latched_victim_way] <= 1'b1;
+                        dirty[latched_set][latched_victim_way] <= 1'b0;
+
+                        // Return to IDLE for next instruction
+                        state <= STATE_IDLE;
+                    end
+                end
+
+                default: state <= STATE_IDLE;
+            endcase
+        end
+    end
 
 endmodule
 
