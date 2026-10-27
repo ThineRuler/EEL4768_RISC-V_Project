@@ -121,6 +121,19 @@ module hart #(
     // Pipeline control
     wire stall;
     wire flush;
+    wire icache_stall;
+    wire dcache_stall;
+
+    // Cache interface wires
+    wire        icache_ready;
+    wire [31:0] icache_rdata;
+    wire        dcache_ready;
+    wire [31:0] dcache_rdata;
+    wire        dcache_ren;
+    wire        dcache_wen;
+    wire [31:0] dcache_addr;
+    wire [ 3:0] dcache_mask;
+    wire [31:0] dcache_wdata;
 
     // ------------------------------------------------------------------------
     // IF Stage Signals
@@ -324,16 +337,44 @@ module hart #(
     // 1. Program Counter (PC) & IF Stage
     // ========================================================================
 
-    assign o_imem_raddr = PC;
+    cache #(
+        .EVICT_POLICY (EVICT_POLICY),
+        .NUM_WAYS     (NUM_WAYS),
+        .CACHE_SIZE   (CACHE_SIZE),
+        .BLOCK_SIZE   (BLOCK_SIZE),
+        .PREFETCH_EN  (PREFETCH_EN)
+    ) icache_i (
+        .i_clk         (i_clk),
+        .i_rst         (i_rst),
+        .i_ren         (!i_rst),
+        .i_wen         (1'b0),
+        .i_addr        (PC),
+        .i_mask        (4'b0000),
+        .i_wdata       (32'd0),
+        .o_ready       (icache_ready),
+        .o_rdata       (icache_rdata),
+        .o_mem_rd      (o_imem_rd),
+        .o_mem_rd_addr (o_imem_rd_addr),
+        .i_mem_valid   (i_imem_valid),
+        .i_mem_rd_data (i_imem_rd_data),
+        .o_mem_wr      (),
+        .o_mem_wr_addr (),
+        .o_mem_wr_data (),
+        .o_mem_wr_be   ()
+    );
+
+    assign icache_stall = !icache_ready;
     assign nxt_instruct = PC + 32'd4;
     assign next_pc      = flush ? EX_next_pc : nxt_instruct;
 
     always @(posedge i_clk) begin
         if (i_rst)
             PC <= RESET_ADDR;
+        else if (dcache_stall)
+            PC <= PC;
         else if (flush)
             PC <= EX_next_pc;
-        else if (stall)
+        else if (stall || icache_stall)
             PC <= PC;
         else
             PC <= nxt_instruct;
@@ -349,6 +390,11 @@ module hart #(
             IF_ID_instruct <= 32'h00000013; // NOP instruction (addi x0, x0, 0)
             IF_ID_next_pc  <= 32'd0;
             IF_ID_valid    <= 1'b0;
+        end else if (dcache_stall) begin
+            IF_ID_PC       <= IF_ID_PC;
+            IF_ID_instruct <= IF_ID_instruct;
+            IF_ID_next_pc  <= IF_ID_next_pc;
+            IF_ID_valid    <= IF_ID_valid;
         end else if (flush) begin
             IF_ID_PC       <= 32'd0;
             IF_ID_instruct <= 32'h00000013; // Flushed bubble
@@ -359,9 +405,14 @@ module hart #(
             IF_ID_instruct <= IF_ID_instruct;
             IF_ID_next_pc  <= IF_ID_next_pc;
             IF_ID_valid    <= IF_ID_valid;
+        end else if (icache_stall) begin
+            IF_ID_PC       <= 32'd0;
+            IF_ID_instruct <= 32'h00000013; // I-cache miss bubble
+            IF_ID_next_pc  <= 32'd0;
+            IF_ID_valid    <= 1'b0;
         end else begin
             IF_ID_PC       <= PC;
-            IF_ID_instruct <= i_imem_rdata;
+            IF_ID_instruct <= icache_rdata;
             IF_ID_next_pc  <= nxt_instruct;
             IF_ID_valid    <= 1'b1;
         end
@@ -519,6 +570,49 @@ module hart #(
             ID_EX_rs1_is_read     <= 1'b0;
             ID_EX_rs2_is_read     <= 1'b0;
             ID_EX_trap            <= 1'b0;
+        end else if (dcache_stall) begin
+            ID_EX_PC              <= ID_EX_PC;
+            ID_EX_next_pc         <= ID_EX_next_pc;
+            ID_EX_link_pc         <= ID_EX_link_pc;
+            ID_EX_instruct        <= ID_EX_instruct;
+            ID_EX_valid           <= ID_EX_valid;
+
+            ID_EX_rs1             <= ID_EX_rs1;
+            ID_EX_rs2             <= ID_EX_rs2;
+            ID_EX_rd              <= ID_EX_rd;
+            ID_EX_immediate       <= ID_EX_immediate;
+
+            ID_EX_rs1_data        <= r_forward_rs1;
+            ID_EX_rs2_data        <= r_forward_rs2;
+
+            ID_EX_op1_sel         <= ID_EX_op1_sel;
+            ID_EX_op2_sel         <= ID_EX_op2_sel;
+            ID_EX_alu_opsel       <= ID_EX_alu_opsel;
+            ID_EX_alu_sub         <= ID_EX_alu_sub;
+            ID_EX_alu_unsigned    <= ID_EX_alu_unsigned;
+            ID_EX_alu_arith       <= ID_EX_alu_arith;
+
+            ID_EX_branch          <= ID_EX_branch;
+            ID_EX_jump            <= ID_EX_jump;
+            ID_EX_branch_equal    <= ID_EX_branch_equal;
+            ID_EX_branch_unsigned <= ID_EX_branch_unsigned;
+            ID_EX_branch_invert   <= ID_EX_branch_invert;
+
+            ID_EX_dmem_ren        <= ID_EX_dmem_ren;
+            ID_EX_dmem_wen        <= ID_EX_dmem_wen;
+            ID_EX_dmem_align      <= ID_EX_dmem_align;
+            ID_EX_dmem_memb       <= ID_EX_dmem_memb;
+            ID_EX_dmem_memh       <= ID_EX_dmem_memh;
+            ID_EX_dmem_memw       <= ID_EX_dmem_memw;
+            ID_EX_dmem_memu       <= ID_EX_dmem_memu;
+
+            ID_EX_rd_sel          <= ID_EX_rd_sel;
+            ID_EX_pc_sel          <= ID_EX_pc_sel;
+            ID_EX_legal           <= ID_EX_legal;
+            ID_EX_halt            <= ID_EX_halt;
+            ID_EX_rs1_is_read     <= ID_EX_rs1_is_read;
+            ID_EX_rs2_is_read     <= ID_EX_rs2_is_read;
+            ID_EX_trap            <= ID_EX_trap;
         end else if (flush || stall) begin
             // Insert bubble into EX on branch/jump flush or load-use stall
             ID_EX_PC              <= 32'd0;
@@ -699,7 +793,8 @@ module hart #(
     assign is_jump       = ID_EX_valid && (!ID_EX_trap) && ID_EX_jump;
 
     // Flushing signal: flushes IF/ID and ID/EX on taken branch or jump resolved in EX
-    assign flush = is_jump || branch_taken;
+    // Suppressed during D-cache stall (Section 4.7)
+    assign flush = (is_jump || branch_taken) && (!dcache_stall);
 
     assign EX_next_pc = is_jump      ? jump_target :
                         branch_taken ? branch_target :
@@ -740,6 +835,37 @@ module hart #(
             EX_MEM_rs1_is_read <= 1'b0;
             EX_MEM_rs2_is_read <= 1'b0;
             EX_MEM_trap        <= 1'b0;
+        end else if (dcache_stall) begin
+            // Hold all EX/MEM values during D-cache stall (Section 4.7)
+            EX_MEM_PC          <= EX_MEM_PC;
+            EX_MEM_next_pc     <= EX_MEM_next_pc;
+            EX_MEM_link_pc     <= EX_MEM_link_pc;
+            EX_MEM_instruct    <= EX_MEM_instruct;
+            EX_MEM_valid       <= EX_MEM_valid;
+
+            EX_MEM_result      <= EX_MEM_result;
+            EX_MEM_rs2_data    <= r_store_data;
+            EX_MEM_rd          <= EX_MEM_rd;
+            EX_MEM_immediate   <= EX_MEM_immediate;
+
+            EX_MEM_dmem_ren    <= EX_MEM_dmem_ren;
+            EX_MEM_dmem_wen    <= EX_MEM_dmem_wen;
+            EX_MEM_dmem_align  <= EX_MEM_dmem_align;
+            EX_MEM_dmem_memb   <= EX_MEM_dmem_memb;
+            EX_MEM_dmem_memh   <= EX_MEM_dmem_memh;
+            EX_MEM_dmem_memw   <= EX_MEM_dmem_memw;
+            EX_MEM_dmem_memu   <= EX_MEM_dmem_memu;
+
+            EX_MEM_rd_sel      <= EX_MEM_rd_sel;
+            EX_MEM_pc_sel      <= EX_MEM_pc_sel;
+            EX_MEM_legal       <= EX_MEM_legal;
+            EX_MEM_halt        <= EX_MEM_halt;
+            EX_MEM_rs1         <= EX_MEM_rs1;
+            EX_MEM_rs2         <= EX_MEM_rs2;
+            EX_MEM_rs1_data    <= EX_MEM_rs1_data;
+            EX_MEM_rs1_is_read <= EX_MEM_rs1_is_read;
+            EX_MEM_rs2_is_read <= EX_MEM_rs2_is_read;
+            EX_MEM_trap        <= EX_MEM_trap;
         end else begin
             EX_MEM_PC          <= ID_EX_PC;
             EX_MEM_next_pc     <= EX_next_pc;
@@ -804,24 +930,22 @@ module hart #(
 
     assign trap_in_mem = EX_MEM_trap | misaligned_access;
 
-    // Word-aligned address output to memory
-    assign o_dmem_addr = {EX_MEM_result[31:2], 2'b00};
-
-    // Suppress memory access on trap or halt
-    assign o_dmem_ren  = EX_MEM_valid & EX_MEM_dmem_ren & (!trap_in_mem) & (!EX_MEM_halt);
-    assign o_dmem_wen  = EX_MEM_valid & EX_MEM_dmem_wen & (!trap_in_mem) & (!EX_MEM_halt);
+    // D-Cache CPU interface signals
+    assign dcache_ren   = EX_MEM_valid & EX_MEM_dmem_ren & (!trap_in_mem) & (!EX_MEM_halt);
+    assign dcache_wen   = EX_MEM_valid & EX_MEM_dmem_wen & (!trap_in_mem) & (!EX_MEM_halt);
+    assign dcache_addr  = EX_MEM_result;
 
     // Byte lane mask generation
-    assign o_dmem_mask = EX_MEM_dmem_memw ? 4'b1111 :
-                         EX_MEM_dmem_memh ? (mem_byte_offset[1] ? 4'b1100 : 4'b0011) :
-                         EX_MEM_dmem_memb ? (
-                             (mem_byte_offset == 2'b00) ? 4'b0001 :
-                             (mem_byte_offset == 2'b01) ? 4'b0010 :
-                             (mem_byte_offset == 2'b10) ? 4'b0100 : 4'b1000
-                         ) : 4'b0000;
+    assign dcache_mask  = EX_MEM_dmem_memw ? 4'b1111 :
+                          EX_MEM_dmem_memh ? (mem_byte_offset[1] ? 4'b1100 : 4'b0011) :
+                          EX_MEM_dmem_memb ? (
+                              (mem_byte_offset == 2'b00) ? 4'b0001 :
+                              (mem_byte_offset == 2'b01) ? 4'b0010 :
+                              (mem_byte_offset == 2'b10) ? 4'b0100 : 4'b1000
+                          ) : 4'b0000;
 
     // Store data positioning into active byte lanes
-    assign o_dmem_wdata = EX_MEM_dmem_memw ? r_store_data :
+    assign dcache_wdata = EX_MEM_dmem_memw ? r_store_data :
                           EX_MEM_dmem_memh ? (mem_byte_offset[1] ? {r_store_data[15:0], 16'b0} : {16'b0, r_store_data[15:0]}) :
                           EX_MEM_dmem_memb ? (
                               (mem_byte_offset == 2'b00) ? {24'b0, r_store_data[7:0]} :
@@ -830,15 +954,44 @@ module hart #(
                                                            {r_store_data[7:0], 24'b0}
                           ) : r_store_data;
 
-    // Load data byte lane extraction and sign/zero extension
-    assign raw_byte = (mem_byte_offset == 2'b00) ? i_dmem_rdata[ 7: 0] :
-                      (mem_byte_offset == 2'b01) ? i_dmem_rdata[15: 8] :
-                      (mem_byte_offset == 2'b10) ? i_dmem_rdata[23:16] :
-                                                   i_dmem_rdata[31:24];
+    cache #(
+        .EVICT_POLICY (EVICT_POLICY),
+        .NUM_WAYS     (NUM_WAYS),
+        .CACHE_SIZE   (CACHE_SIZE),
+        .BLOCK_SIZE   (BLOCK_SIZE),
+        .PREFETCH_EN  (PREFETCH_EN)
+    ) dcache_i (
+        .i_clk         (i_clk),
+        .i_rst         (i_rst),
+        .i_ren         (dcache_ren),
+        .i_wen         (dcache_wen),
+        .i_addr        (dcache_addr),
+        .i_mask        (dcache_mask),
+        .i_wdata       (dcache_wdata),
+        .o_ready       (dcache_ready),
+        .o_rdata       (dcache_rdata),
+        .o_mem_rd      (o_dmem_rd),
+        .o_mem_rd_addr (o_dmem_rd_addr),
+        .i_mem_valid   (i_dmem_valid),
+        .i_mem_rd_data (i_dmem_rd_data),
+        .o_mem_wr      (o_dmem_wr),
+        .o_mem_wr_addr (o_dmem_wr_addr),
+        .o_mem_wr_data (o_dmem_wr_data),
+        .o_mem_wr_be   (o_dmem_wr_be)
+    );
 
-    assign raw_half = mem_byte_offset[1] ? i_dmem_rdata[31:16] : i_dmem_rdata[15:0];
+    // D-cache stall occurs when an active load or store waits on cache/memory
+    assign dcache_stall = (dcache_ren || dcache_wen) && (!dcache_ready);
 
-    assign mem_rdata_ext = EX_MEM_dmem_memw ? i_dmem_rdata :
+    // Load data byte lane extraction and sign/zero extension from dcache_rdata
+    assign raw_byte = (mem_byte_offset == 2'b00) ? dcache_rdata[ 7: 0] :
+                      (mem_byte_offset == 2'b01) ? dcache_rdata[15: 8] :
+                      (mem_byte_offset == 2'b10) ? dcache_rdata[23:16] :
+                                                   dcache_rdata[31:24];
+
+    assign raw_half = mem_byte_offset[1] ? dcache_rdata[31:16] : dcache_rdata[15:0];
+
+    assign mem_rdata_ext = EX_MEM_dmem_memw ? dcache_rdata :
                            EX_MEM_dmem_memh ? (EX_MEM_dmem_memu ? {16'b0, raw_half} : {{16{raw_half[15]}}, raw_half}) :
                            EX_MEM_dmem_memb ? (EX_MEM_dmem_memu ? {24'b0, raw_byte} : {{24{raw_byte[7]}}, raw_byte}) :
                                               32'd0;
@@ -878,6 +1031,9 @@ module hart #(
             MEM_WB_dmem_mask   <= 4'd0;
             MEM_WB_dmem_rdata  <= 32'd0;
             MEM_WB_dmem_wdata  <= 32'd0;
+        end else if (dcache_stall) begin
+            // Hold MEM stage and inject bubble into WB so instruction does not re-retire
+            MEM_WB_valid <= 1'b0;
         end else begin
             // Latch values from EX/MEM stage to MEM/WB stage
             MEM_WB_PC          <= EX_MEM_PC;
@@ -887,7 +1043,7 @@ module hart #(
             MEM_WB_valid       <= EX_MEM_valid;
 
             MEM_WB_result      <= EX_MEM_result;
-            MEM_WB_mem_rdata   <= mem_rdata_ext; // Load data from memory
+            MEM_WB_mem_rdata   <= mem_rdata_ext; // Load data from dcache
             MEM_WB_rd          <= EX_MEM_rd;
             MEM_WB_immediate   <= EX_MEM_immediate;
             MEM_WB_rd_sel      <= EX_MEM_rd_sel;
@@ -906,12 +1062,12 @@ module hart #(
             MEM_WB_rs2_is_read <= EX_MEM_rs2_is_read;
 
             // Latch memory operation control signals for retirement
-            MEM_WB_dmem_addr   <= o_dmem_addr;
-            MEM_WB_dmem_ren    <= o_dmem_ren;
-            MEM_WB_dmem_wen    <= o_dmem_wen;
-            MEM_WB_dmem_mask   <= o_dmem_mask;
-            MEM_WB_dmem_rdata  <= i_dmem_rdata;
-            MEM_WB_dmem_wdata  <= o_dmem_wdata;
+            MEM_WB_dmem_addr   <= {EX_MEM_result[31:2], 2'b00};
+            MEM_WB_dmem_ren    <= dcache_ren;
+            MEM_WB_dmem_wen    <= dcache_wen;
+            MEM_WB_dmem_mask   <= dcache_mask;
+            MEM_WB_dmem_rdata  <= dcache_rdata;
+            MEM_WB_dmem_wdata  <= dcache_wdata;
         end
     end
 
