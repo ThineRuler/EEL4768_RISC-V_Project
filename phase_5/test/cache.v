@@ -101,6 +101,7 @@ module cache #(
     localparam TOTAL_BYTES     = CACHE_SIZE * 1024;
     localparam TOTAL_BLOCKS    = TOTAL_BYTES / BLOCK_SIZE;
     localparam NUM_SETS        = TOTAL_BLOCKS / NUM_WAYS;
+    localparam [31:0] BLOCK_SIZE_BYTES = BLOCK_SIZE;
 
     // Address field widths
     localparam OFFSET_BITS     = $clog2(BLOCK_SIZE);
@@ -115,6 +116,7 @@ module cache #(
     // Way indexing
     localparam WAY_BITS_RAW    = $clog2(NUM_WAYS);
     localparam WAY_BITS        = (WAY_BITS_RAW > 0) ? WAY_BITS_RAW : 1;
+    localparam PENULT_WAY      = (NUM_WAYS > 1) ? (NUM_WAYS - 2) : 0;
 
     // PLRU tree nodes per set: an N-way binary tree requires N - 1 decision bits
     localparam PLRU_NODES      = (NUM_WAYS > 1) ? (NUM_WAYS - 1) : 1;
@@ -180,7 +182,8 @@ module cache #(
             for (gb_idx = 0; gb_idx < WAY_BITS; gb_idx = gb_idx + 1) begin : gen_hit_bit
                 wire [NUM_WAYS-1:0] bit_matches;
                 for (gw_idx = 0; gw_idx < NUM_WAYS; gw_idx = gw_idx + 1) begin : gen_hit_cand
-                    localparam integer BIT_VAL = (gw_idx >> gb_idx) & 1;
+                    localparam [WAY_BITS-1:0] GW_VAL = gw_idx;
+                    localparam integer BIT_VAL = GW_VAL[gb_idx];
                     assign bit_matches[gw_idx] = way_hit[gw_idx] && (BIT_VAL == 1);
                 end
                 assign hit_way[gb_idx] = |bit_matches;
@@ -225,7 +228,8 @@ module cache #(
             for (gb_i = 0; gb_i < WAY_BITS; gb_i = gb_i + 1) begin : gen_inv_bit
                 wire [NUM_WAYS-1:0] bit_cands;
                 for (gw_i = 0; gw_i < NUM_WAYS; gw_i = gw_i + 1) begin : gen_inv_cand
-                    localparam integer B_VAL = (gw_i >> gb_i) & 1;
+                    localparam [WAY_BITS-1:0] GW_VAL = gw_i;
+                    localparam integer B_VAL = GW_VAL[gb_i];
                     assign bit_cands[gw_i] = first_invalid[gw_i] && (B_VAL == 1);
                 end
                 assign lowest_invalid_way[gb_i] = |bit_cands;
@@ -416,11 +420,11 @@ wire [31:0] latched_block_addr =
     {latched_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
 
 wire [31:0] next_line_addr =
-    latched_block_addr + BLOCK_SIZE;
+    latched_block_addr + BLOCK_SIZE_BYTES;
 
 // Current CPU request's next-line address.
 wire [31:0] current_next_line_addr =
-    {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} + BLOCK_SIZE;
+    {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} + BLOCK_SIZE_BYTES;
 wire [TAG_BITS-1:0] current_next_line_tag =
     current_next_line_addr[31 : 32 - TAG_BITS];
 wire [SET_BITS-1:0] current_next_line_set;
@@ -495,7 +499,8 @@ generate
         for (pgb_i = 0; pgb_i < WAY_BITS; pgb_i = pgb_i + 1) begin : gen_prefetch_inv_bit
             wire [NUM_WAYS-1:0] prefetch_bit_cands;
             for (pgw_i = 0; pgw_i < NUM_WAYS; pgw_i = pgw_i + 1) begin : gen_prefetch_inv_cand
-                localparam integer PIV_VAL = (pgw_i >> pgb_i) & 1;
+                localparam [WAY_BITS-1:0] PGW_VAL = pgw_i;
+                localparam integer PIV_VAL = PGW_VAL[pgb_i];
                 assign prefetch_bit_cands[pgw_i] =
                     prefetch_first_invalid[pgw_i] && (PIV_VAL == 1);
             end
@@ -802,7 +807,7 @@ wire prefetch_block_cpu = (state == STATE_IDLE) && prefetch_pending && !prefetch
                                 prefetch_victim_way <= 0;
                             else
                                 prefetch_victim_way <= (order[latched_set][NUM_WAYS-1] == latched_victim_way) ?
-                                                       order[latched_set][NUM_WAYS-2] :
+                                                       order[latched_set][PENULT_WAY] :
                                                        order[latched_set][NUM_WAYS-1];
                         end
 
