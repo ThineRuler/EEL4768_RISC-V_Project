@@ -127,6 +127,12 @@ module prefetch_collision_tb;
         end
     end
 
+
+    // This signal is only used by the testbench to identify that the
+    // prefetch request has already been issued and is still outstanding.
+    wire prefetch_pending_visible =
+        dut.prefetch_pending && dut.prefetch_issued;
+
     task start_read;
         input [31:0] a;
         begin
@@ -168,10 +174,6 @@ module prefetch_collision_tb;
         end
     endtask
 
-    // This signal is only used by the testbench to identify that the
-    // prefetch request has already been issued and is still outstanding.
-    wire prefetch_pending_visible =
-        dut.prefetch_pending && dut.prefetch_issued;
 
     initial begin
         clk = 1'b0;
