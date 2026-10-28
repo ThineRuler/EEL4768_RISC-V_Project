@@ -198,7 +198,7 @@ module cache #(
     wire [31:0]              hit_word         = hit_line_data[hit_word_bit_idx +: 32];
 
     // ------------------------------------------------------------------------
-    // 5. Victim Selection Logic (on a Miss)
+    // 5. Victim Selection Logic (on a Demand Miss)
     // ------------------------------------------------------------------------
     // Section 4.3 & 4.11 Requirement:
     // "The lowest-numbered invalid way is always used before evicting a valid one."
@@ -238,17 +238,10 @@ module cache #(
     endgenerate
 
     // Replacement Policy 0: True LRU (Least Recently Used)
-    // Maintains an order list order[s][0..NUM_WAYS-1] per set:
-    //  - order[s][0] is the Most Recently Used (MRU) way.
-    //  - order[s][NUM_WAYS-1] is the Least Recently Used (LRU) way.
     reg [WAY_BITS-1:0] order [0:NUM_SETS-1][0:NUM_WAYS-1];
     wire [WAY_BITS-1:0] lru_victim = (NUM_WAYS > 1) ? order[req_set][NUM_WAYS-1] : 1'b0;
 
     // Replacement Policy 1: PLRU (Pseudo-LRU) Binary Decision Tree
-    // Section 4.3.2 & Figure 1:
-    //  - Bit value 0 points LEFT; bit value 1 points RIGHT.
-    //  - On a miss: Traverses tree without updating to locate victim leaf.
-    //  - On hit or fill: Tree nodes along access path flip to point away from accessed way.
     reg [PLRU_NODES-1:0] plru_tree [0:NUM_SETS-1];
     wire [WAY_BITS-1:0]  plru_victim;
     wire [NODE_BITS-1:0] trav_node [0:WAY_BITS-1];
@@ -280,18 +273,167 @@ module cache #(
     wire victim_is_dirty = valid[req_set][victim_way] && dirty[req_set][victim_way];
 
     // ------------------------------------------------------------------------
-    // 6. Next Replacement State Computation (LRU & PLRU)
+    // 6. Prefetch Trigger & Target Victim Selection (at Demand Miss Time)
+    // ------------------------------------------------------------------------
+    reg                    prefetch_pending;
+    reg                    prefetch_issued;
+    reg [31:0]             prefetch_addr;
+    reg [SET_BITS-1:0]     prefetch_set;
+    reg [WAY_BITS-1:0]     prefetch_victim_way;
+    reg [TAG_BITS-1:0]     prefetch_tag;
+    reg [TAG_BITS-1:0]     prefetch_victim_tag;
+    reg [BLOCK_SIZE*8-1:0] prefetch_victim_data;
+    reg                    prefetch_victim_dirty;
+    reg                    prefetch_wb_issued;
+
+    // Next-line address: miss_address + BLOCK_SIZE ({tag, index} + 1)
+    wire [31:0] current_next_line_addr =
+        {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} + BLOCK_SIZE_BYTES;
+    wire [TAG_BITS-1:0] current_next_line_tag =
+        current_next_line_addr[31 : 32 - TAG_BITS];
+    wire [SET_BITS-1:0] current_next_line_set;
+    generate
+        if (NUM_SETS > 1) begin : gen_current_next_set
+            assign current_next_line_set =
+                current_next_line_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
+        end else begin : gen_current_next_set_fa
+            assign current_next_line_set = 1'b0;
+        end
+    endgenerate
+
+    // Check if next line is already in cache (skip prefetch if present)
+    wire [NUM_WAYS-1:0] prefetch_way_hit;
+    genvar pw;
+    generate
+        for (pw = 0; pw < NUM_WAYS; pw = pw + 1) begin : gen_prefetch_way_hit
+            assign prefetch_way_hit[pw] =
+                valid[current_next_line_set][pw] &&
+                (tags[current_next_line_set][pw] == current_next_line_tag);
+        end
+    endgenerate
+    wire prefetch_hit = |prefetch_way_hit;
+
+    // Prefetch victim selection at miss time:
+    // If prefetch_set == req_set (e.g. fully associative or same set),
+    // victim_way is reserved for the demand line! So prefetch must choose
+    // a DIFFERENT way.
+    wire prefetch_same_set = (NUM_SETS == 1) || (current_next_line_set == req_set);
+
+    wire [NUM_WAYS-1:0] prefetch_invalid_way;
+    genvar pi;
+    generate
+        for (pi = 0; pi < NUM_WAYS; pi = pi + 1) begin : gen_prefetch_invalid
+            localparam [WAY_BITS-1:0] PI_VAL = pi;
+            assign prefetch_invalid_way[pi] =
+                !valid[current_next_line_set][pi] &&
+                (!prefetch_same_set || (NUM_WAYS == 1) || (PI_VAL != victim_way));
+        end
+    endgenerate
+
+    wire prefetch_has_invalid = |prefetch_invalid_way;
+
+    wire [WAY_BITS-1:0] prefetch_lowest_invalid_way;
+    generate
+        if (NUM_WAYS == 1) begin : gen_prefetch_inv_dm
+            assign prefetch_lowest_invalid_way = 1'b0;
+        end else begin : gen_prefetch_inv_mw
+            wire [NUM_WAYS-1:0] prefetch_first_invalid;
+            assign prefetch_first_invalid[0] = prefetch_invalid_way[0];
+            for (pi = 1; pi < NUM_WAYS; pi = pi + 1) begin : gen_prefetch_first_inv
+                assign prefetch_first_invalid[pi] =
+                    prefetch_invalid_way[pi] && (~|prefetch_invalid_way[pi-1:0]);
+            end
+            genvar pgb_i, pgw_i;
+            for (pgb_i = 0; pgb_i < WAY_BITS; pgb_i = pgb_i + 1) begin : gen_prefetch_inv_bit
+                wire [NUM_WAYS-1:0] prefetch_bit_cands;
+                for (pgw_i = 0; pgw_i < NUM_WAYS; pgw_i = pgw_i + 1) begin : gen_prefetch_inv_cand
+                    localparam [WAY_BITS-1:0] PGW_VAL = pgw_i;
+                    localparam integer PIV_VAL = PGW_VAL[pgb_i];
+                    assign prefetch_bit_cands[pgw_i] =
+                        prefetch_first_invalid[pgw_i] && (PIV_VAL == 1);
+                end
+                assign prefetch_lowest_invalid_way[pgb_i] = |prefetch_bit_cands;
+            end
+        end
+    endgenerate
+
+    // LRU victim for prefetch (avoiding victim_way if same set):
+    wire [WAY_BITS-1:0] prefetch_lru_victim =
+        (NUM_WAYS <= 1) ? 1'b0 :
+        (prefetch_same_set && (order[current_next_line_set][NUM_WAYS-1] == victim_way)) ?
+            order[current_next_line_set][PENULT_WAY] :
+            order[current_next_line_set][NUM_WAYS-1];
+
+    // PLRU victim for prefetch:
+    wire [WAY_BITS-1:0] prefetch_plru_victim;
+    wire [NODE_BITS-1:0] prefetch_trav_node [0:WAY_BITS-1];
+    genvar ptd;
+    generate
+        if (NUM_WAYS <= 1) begin : gen_prefetch_plru_dm
+            assign prefetch_plru_victim = 1'b0;
+        end else begin : gen_prefetch_plru_mw
+            assign prefetch_trav_node[0] = {NODE_BITS{1'b0}};
+            assign prefetch_plru_victim[WAY_BITS-1] = plru_tree[current_next_line_set][0];
+            for (ptd = 1; ptd < WAY_BITS; ptd = ptd + 1) begin : gen_prefetch_trav
+                wire pbit = plru_tree[current_next_line_set][prefetch_trav_node[ptd-1]];
+                assign prefetch_trav_node[ptd] = pbit ?
+                    ((prefetch_trav_node[ptd-1] << 1) + {{(NODE_BITS-2){1'b0}}, 2'd2}) :
+                    ((prefetch_trav_node[ptd-1] << 1) + {{(NODE_BITS-1){1'b0}}, 1'd1});
+                assign prefetch_plru_victim[WAY_BITS-1-ptd] =
+                    plru_tree[current_next_line_set][prefetch_trav_node[ptd]];
+            end
+        end
+    endgenerate
+
+    wire [WAY_BITS-1:0] prefetch_victim_way_now =
+        (NUM_WAYS == 1) ? 1'b0 :
+        prefetch_has_invalid ? prefetch_lowest_invalid_way :
+        (EVICT_POLICY == 0) ? prefetch_lru_victim : prefetch_plru_victim;
+
+    // ------------------------------------------------------------------------
+    // 7. FSM States & Miss Registers
+    // ------------------------------------------------------------------------
+    localparam STATE_IDLE      = 2'd0; // Servicing hits or detecting misses
+    localparam STATE_DIRTY_WB  = 2'd1; // Writing back dirty victim block to main memory
+    localparam STATE_READ_REQ  = 2'd2; // Pulsing memory read request for missed line
+    localparam STATE_WAIT_DATA = 2'd3; // Waiting for i_mem_valid from memory
+
+    reg [1:0] state;
+
+    // Registers to latch miss context across memory stall cycles
+    reg [31:0]             latched_addr;
+    reg [WAY_BITS-1:0]     latched_victim_way;
+    reg [TAG_BITS-1:0]     latched_victim_tag;
+    reg [BLOCK_SIZE*8-1:0] latched_victim_data;
+
+    wire [SET_BITS-1:0]    latched_set;
+    generate
+        if (NUM_SETS > 1) begin : gen_latched_set
+            assign latched_set = latched_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
+        end else begin : gen_latched_set_fa
+            assign latched_set = 1'b0;
+        end
+    endgenerate
+
+    // Prefetch response arrives in STATE_IDLE
+    wire prefetch_response = (state == STATE_IDLE) && prefetch_pending && prefetch_issued && i_mem_valid;
+
+    // ------------------------------------------------------------------------
+    // 8. Replacement State Update Calculations (LRU & PLRU)
     // ------------------------------------------------------------------------
     // Both policies update when an access finishes:
     //  1. Read Hit or Store Hit in STATE_IDLE (access to hit_way)
     //  2. Line Fill in STATE_WAIT_DATA upon i_mem_valid (access to latched_victim_way)
-    wire [SET_BITS-1:0] update_set;
-    wire [WAY_BITS-1:0] update_way;
-    wire                access_update;
+    //  3. Prefetch Fill in STATE_IDLE upon prefetch_response (access to prefetch_victim_way)
+    wire [SET_BITS-1:0] update_set = prefetch_response ? prefetch_set :
+                                     (state == STATE_WAIT_DATA) ? latched_set : req_set;
+    wire [WAY_BITS-1:0] update_way = prefetch_response ? prefetch_victim_way :
+                                     (state == STATE_WAIT_DATA) ? latched_victim_way : hit_way;
+    wire access_update = prefetch_response ||
+                         (state == STATE_IDLE && (i_ren || i_wen) && hit) ||
+                         (state == STATE_WAIT_DATA && i_mem_valid);
 
-    // LRU next order computation:
-    // On access to update_way, update_way moves to slot 0 (MRU).
-    // Slots that were ahead of update_way shift right by 1; slots behind it stay.
+    // LRU next order computation
     wire [WAY_BITS-1:0] next_order [0:NUM_SETS-1][0:NUM_WAYS-1];
     genvar s_g, w_g, p_g;
     generate
@@ -312,8 +454,7 @@ module cache #(
         end
     endgenerate
 
-    // PLRU next tree computation:
-    // Identify nodes on path to update_way and flip each to point AWAY from update_way.
+    // PLRU next tree computation
     wire [NODE_BITS-1:0] upd_node [0:WAY_BITS-1];
     generate
         if (NUM_WAYS > 1) begin : gen_upd_nodes
@@ -352,10 +493,9 @@ module cache #(
     endgenerate
 
     // ------------------------------------------------------------------------
-    // 7. Write Data & Byte Enable Generators
+    // 9. Write Data & Byte Enable Generators
     // ------------------------------------------------------------------------
-    // Store Hit (Write-Back):
-    // Merges store bytes into the hit way's block using i_mask and i_wdata.
+    // Store Hit (Write-Back)
     wire [BLOCK_SIZE*8-1:0] store_hit_updated_line;
     genvar gb;
     generate
@@ -368,9 +508,7 @@ module cache #(
         end
     endgenerate
 
-    // Store Miss (Write-Through, No-Allocate):
-    // Places store bytes at the appropriate byte positions within a BLOCK_SIZE line,
-    // and sets byte enables only for the modified bytes.
+    // Store Miss (Write-Through, No-Allocate)
     wire [BLOCK_SIZE*8-1:0] store_miss_mem_wr_data;
     wire [BLOCK_SIZE-1:0]   store_miss_mem_wr_be;
     generate
@@ -384,174 +522,11 @@ module cache #(
     endgenerate
 
     // ------------------------------------------------------------------------
-    // 8. FSM States & Miss Registers
+    // 10. Memory Address & Word Reconstruction
     // ------------------------------------------------------------------------
-    localparam STATE_IDLE      = 2'd0; // Servicing hits or detecting misses
-    localparam STATE_DIRTY_WB  = 2'd1; // Writing back dirty victim block to main memory
-    localparam STATE_READ_REQ  = 2'd2; // Pulsing memory read request for missed line
-    localparam STATE_WAIT_DATA = 2'd3; // Waiting for i_mem_valid from memory
-
-    reg [1:0] state;
-
-    // Registers to latch miss context across memory stall cycles
-    reg [31:0]             latched_addr;
-    reg [WAY_BITS-1:0]     latched_victim_way;
-    reg [TAG_BITS-1:0]     latched_victim_tag;
-    reg [BLOCK_SIZE*8-1:0] latched_victim_data;
-
-    // ------------------------------------------------------------------------
-// Prefetch context
-// ------------------------------------------------------------------------
-reg                  prefetch_pending;
-reg                  prefetch_issued;
-reg [31:0]           prefetch_addr;
-reg [SET_BITS-1:0]   prefetch_set;
-reg [WAY_BITS-1:0]   prefetch_victim_way;
-reg [TAG_BITS-1:0]   prefetch_tag;
-reg [TAG_BITS-1:0]   prefetch_victim_tag;
-reg [BLOCK_SIZE*8-1:0] prefetch_victim_data;
-reg                  prefetch_victim_dirty;
-reg                  prefetch_wb_issued;
-
-// ------------------------------------------------------------------------
-// Next-line prefetch address
-// ------------------------------------------------------------------------
-wire [31:0] latched_block_addr =
-    {latched_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
-
-wire [31:0] next_line_addr =
-    latched_block_addr + BLOCK_SIZE_BYTES;
-
-// Current CPU request's next-line address.
-wire [31:0] current_next_line_addr =
-    {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} + BLOCK_SIZE_BYTES;
-wire [TAG_BITS-1:0] current_next_line_tag =
-    current_next_line_addr[31 : 32 - TAG_BITS];
-wire [SET_BITS-1:0] current_next_line_set;
-generate
-    if (NUM_SETS > 1) begin : gen_current_next_set
-        assign current_next_line_set =
-            current_next_line_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
-    end else begin : gen_current_next_set_fa
-        assign current_next_line_set = 1'b0;
-    end
-endgenerate
-
-    // ------------------------------------------------------------------------
-// Prefetch address decomposition
-// ------------------------------------------------------------------------
-wire [TAG_BITS-1:0] prefetch_req_tag =
-    next_line_addr[31 : 32 - TAG_BITS];
-
-wire [SET_BITS-1:0] prefetch_req_set;
-
-generate
-    if (NUM_SETS > 1) begin : gen_prefetch_set
-        assign prefetch_req_set =
-            next_line_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
-    end else begin : gen_prefetch_set_fa
-        assign prefetch_req_set = 1'b0;
-    end
-endgenerate
-
-// ------------------------------------------------------------------------
-// Check whether the next line is already in the cache
-// ------------------------------------------------------------------------
-wire [NUM_WAYS-1:0] prefetch_way_hit;
-
-genvar pw;
-generate
-    for (pw = 0; pw < NUM_WAYS; pw = pw + 1) begin : gen_prefetch_way_hit
-        assign prefetch_way_hit[pw] =
-            valid[current_next_line_set][pw] &&
-            (tags[current_next_line_set][pw] == current_next_line_tag);
-    end
-endgenerate
-
-// ------------------------------------------------------------------------
-// Prefetch invalid-way detection
-// ------------------------------------------------------------------------
-wire [NUM_WAYS-1:0] prefetch_invalid_way;
-
-genvar pi;
-generate
-    for (pi = 0; pi < NUM_WAYS; pi = pi + 1) begin : gen_prefetch_invalid
-        assign prefetch_invalid_way[pi] =
-            !valid[current_next_line_set][pi];
-    end
-endgenerate
-
-wire prefetch_has_invalid = |prefetch_invalid_way;
-
-// Lowest invalid way for the prefetch target set.
-wire [WAY_BITS-1:0] prefetch_lowest_invalid_way;
-generate
-    if (NUM_WAYS == 1) begin : gen_prefetch_inv_dm
-        assign prefetch_lowest_invalid_way = 1'b0;
-    end else begin : gen_prefetch_inv_mw
-        wire [NUM_WAYS-1:0] prefetch_first_invalid;
-        assign prefetch_first_invalid[0] = prefetch_invalid_way[0];
-        for (pi = 1; pi < NUM_WAYS; pi = pi + 1) begin : gen_prefetch_first_inv
-            assign prefetch_first_invalid[pi] =
-                prefetch_invalid_way[pi] && (~|prefetch_invalid_way[pi-1:0]);
-        end
-        genvar pgb_i, pgw_i;
-        for (pgb_i = 0; pgb_i < WAY_BITS; pgb_i = pgb_i + 1) begin : gen_prefetch_inv_bit
-            wire [NUM_WAYS-1:0] prefetch_bit_cands;
-            for (pgw_i = 0; pgw_i < NUM_WAYS; pgw_i = pgw_i + 1) begin : gen_prefetch_inv_cand
-                localparam [WAY_BITS-1:0] PGW_VAL = pgw_i;
-                localparam integer PIV_VAL = PGW_VAL[pgb_i];
-                assign prefetch_bit_cands[pgw_i] =
-                    prefetch_first_invalid[pgw_i] && (PIV_VAL == 1);
-            end
-            assign prefetch_lowest_invalid_way[pgb_i] = |prefetch_bit_cands;
-        end
-    end
-endgenerate
-
-wire prefetch_hit = |prefetch_way_hit;
-
-    wire [WAY_BITS-1:0] prefetch_lru_victim =
-        (NUM_WAYS > 1) ? order[current_next_line_set][NUM_WAYS-1] : 1'b0;
-
-    wire [WAY_BITS-1:0] prefetch_plru_victim;
-    wire [NODE_BITS-1:0] prefetch_trav_node [0:WAY_BITS-1];
-
-    genvar ptd;
-    generate
-        if (NUM_WAYS <= 1) begin : gen_prefetch_plru_dm
-            assign prefetch_plru_victim = 1'b0;
-        end else begin : gen_prefetch_plru_mw
-            assign prefetch_trav_node[0] = {NODE_BITS{1'b0}};
-            assign prefetch_plru_victim[WAY_BITS-1] = plru_tree[current_next_line_set][0];
-            for (ptd = 1; ptd < WAY_BITS; ptd = ptd + 1) begin : gen_prefetch_trav
-                wire pbit = plru_tree[current_next_line_set][prefetch_trav_node[ptd-1]];
-                assign prefetch_trav_node[ptd] = pbit ?
-                    ((prefetch_trav_node[ptd-1] << 1) + {{(NODE_BITS-2){1'b0}}, 2'd2}) :
-                    ((prefetch_trav_node[ptd-1] << 1) + {{(NODE_BITS-1){1'b0}}, 1'd1});
-                assign prefetch_plru_victim[WAY_BITS-1-ptd] =
-                    plru_tree[current_next_line_set][prefetch_trav_node[ptd]];
-            end
-        end
-    endgenerate
-
-    wire [WAY_BITS-1:0] prefetch_victim_way_now =
-        prefetch_has_invalid ? prefetch_lowest_invalid_way :
-        (EVICT_POLICY == 0) ? prefetch_lru_victim : prefetch_plru_victim;
-
-    // Sliced fields from latched_addr
     wire [OFFSET_BITS-1:0] latched_offset = latched_addr[OFFSET_BITS-1:0];
     wire [WORD_BITS-1:0]   latched_word   = (OFFSET_BITS > 2) ? latched_offset[OFFSET_BITS-1:2] : 1'b0;
     wire [TAG_BITS-1:0]    latched_tag    = latched_addr[31 : 32 - TAG_BITS];
-
-    wire [SET_BITS-1:0]    latched_set;
-    generate
-        if (NUM_SETS > 1) begin : gen_latched_set
-            assign latched_set = latched_addr[OFFSET_BITS + SET_BITS_RAW - 1 : OFFSET_BITS];
-        end else begin : gen_latched_set_fa
-            assign latched_set = 1'b0;
-        end
-    endgenerate
 
     // Reconstruct memory block address of the evicted dirty line
     wire [31:0] latched_evict_addr;
@@ -567,111 +542,91 @@ wire prefetch_hit = |prefetch_way_hit;
     wire [OFFSET_BITS+3-1:0] latched_word_bit_idx = {latched_word, 5'b00000};
     wire [31:0]              mem_word             = i_mem_rd_data[latched_word_bit_idx +: 32];
 
-    // A prefetch response has priority over a CPU access in the same cycle.
-    wire prefetch_response = (state == STATE_IDLE) && prefetch_pending && prefetch_issued && i_mem_valid;
-wire prefetch_block_cpu = (state == STATE_IDLE) && prefetch_pending && !prefetch_response &&
-                          ((i_ren && !hit) || (i_wen && !hit));
-
-    assign access_update = prefetch_response ||
-                           (state == STATE_IDLE && (i_ren || i_wen) && hit) ||
-                           (state == STATE_WAIT_DATA && i_mem_valid);
-    assign update_set    = prefetch_response ? prefetch_set :
-                           (state == STATE_WAIT_DATA) ? latched_set : req_set;
-    assign update_way    = prefetch_response ? prefetch_victim_way :
-                           (state == STATE_WAIT_DATA) ? latched_victim_way : hit_way;
+    wire [31:0] prefetch_evict_addr;
+    generate
+        if (NUM_SETS > 1) begin : gen_pref_evict_addr
+            assign prefetch_evict_addr = {prefetch_victim_tag, prefetch_set, {OFFSET_BITS{1'b0}}};
+        end else begin : gen_pref_evict_addr_fa
+            assign prefetch_evict_addr = {prefetch_victim_tag, {OFFSET_BITS{1'b0}}};
+        end
+    endgenerate
 
     // ------------------------------------------------------------------------
-    // 9. CPU & Memory Interface Output Assignments
+    // 11. CPU & Memory Interface Output Assignments
     // ------------------------------------------------------------------------
     // CPU Interface:
-    //  - o_ready : High when ready to accept/complete access.
-    //              * In STATE_IDLE: high if no access, if hit, or if store miss (write-through no stall)
-    //              * In STATE_WAIT_DATA: high on the cycle i_mem_valid arrives
-    //              * Otherwise: low (stalls the pipeline)
+    // Option B Prefetch collision handling (Section 4.8.1):
+    // Stall CPU for 1 cycle when prefetched line returns, giving prefetch priority.
     assign o_ready = (state == STATE_IDLE) ?
-                        (prefetch_response || prefetch_block_cpu ? 1'b0 : (!i_ren || hit || i_wen)) :
+                        (prefetch_response ? 1'b0 :
+                         (!i_ren && !i_wen) ? 1'b1 :
+                         hit ? 1'b1 :
+                         i_wen ? 1'b1 : 1'b0) :
                      (state == STATE_WAIT_DATA) ? i_mem_valid :
                      1'b0;
 
-    //  - o_rdata : Multiplexed word returned to CPU.
-    //              * In STATE_WAIT_DATA: word extracted directly from arriving memory line
-    //              * In STATE_IDLE: word extracted from the hit way
     assign o_rdata = (state == STATE_WAIT_DATA) ? mem_word : hit_word;
 
     // Memory Line Read Interface:
-    //  - o_mem_rd : 1-cycle pulse requesting a line from memory.
-    //               * Clean miss: issued directly in STATE_IDLE
-    //               * Dirty miss: issued in STATE_READ_REQ (after dirty write-back completes)
     assign o_mem_rd =
-        (state == STATE_IDLE && !prefetch_response && !prefetch_block_cpu && i_ren && !hit && !victim_is_dirty) ||
+        (state == STATE_IDLE && !prefetch_response && !(prefetch_pending && prefetch_issued) &&
+         i_ren && !hit && !victim_is_dirty) ||
         (state == STATE_READ_REQ) ||
         (state == STATE_WAIT_DATA && prefetch_pending && !prefetch_issued);
 
-    //  - o_mem_rd_addr : Line-aligned address of requested block
     assign o_mem_rd_addr =
         (state == STATE_WAIT_DATA && prefetch_pending && !prefetch_issued) ? prefetch_addr :
-        (state == STATE_READ_REQ) ?
-            {latched_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} :
-            {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+        (state == STATE_READ_REQ) ? {latched_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}} :
+        {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
 
     // Memory Line Write Interface:
-    //  - o_mem_wr : 1-cycle pulse to write a line to memory.
-    //               * Dirty write-back in STATE_DIRTY_WB
-    //               * Store miss write-through in STATE_IDLE
-    assign o_mem_wr = (state == STATE_DIRTY_WB) ||
-                      (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
-                       prefetch_victim_dirty && !prefetch_wb_issued) ||
-                      (state == STATE_IDLE && !prefetch_response && !prefetch_block_cpu && i_wen && !hit);
+    assign o_mem_wr =
+        (state == STATE_DIRTY_WB) ||
+        (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
+         prefetch_victim_dirty && !prefetch_wb_issued) ||
+        (state == STATE_IDLE && !prefetch_response && i_wen && !hit);
 
-    //  - o_mem_wr_addr : Target line address
-    assign o_mem_wr_addr = (state == STATE_DIRTY_WB) ?
-                               latched_evict_addr :
-                           (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
-                            prefetch_victim_dirty && !prefetch_wb_issued) ?
-                               {prefetch_victim_tag, prefetch_set, {OFFSET_BITS{1'b0}}} :
-                               {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+    assign o_mem_wr_addr =
+        (state == STATE_DIRTY_WB) ? latched_evict_addr :
+        (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
+         prefetch_victim_dirty && !prefetch_wb_issued) ? prefetch_evict_addr :
+        {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
 
-    //  - o_mem_wr_data : Block data written to memory
-    assign o_mem_wr_data = (state == STATE_DIRTY_WB) ?
-                               latched_victim_data :
-                           (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
-                            prefetch_victim_dirty && !prefetch_wb_issued) ?
-                               prefetch_victim_data :
-                               store_miss_mem_wr_data;
+    assign o_mem_wr_data =
+        (state == STATE_DIRTY_WB) ? latched_victim_data :
+        (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
+         prefetch_victim_dirty && !prefetch_wb_issued) ? prefetch_victim_data :
+        store_miss_mem_wr_data;
 
-    //  - o_mem_wr_be : One bit per byte. All ones for dirty write-back,
-    //                  or selective bytes for write-through.
-    assign o_mem_wr_be = (state == STATE_DIRTY_WB) ?
-                             {BLOCK_SIZE{1'b1}} :
-                         (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
-                          prefetch_victim_dirty && !prefetch_wb_issued) ?
-                             {BLOCK_SIZE{1'b1}} :
-                             store_miss_mem_wr_be;
-
+    assign o_mem_wr_be =
+        (state == STATE_DIRTY_WB) ? {BLOCK_SIZE{1'b1}} :
+        (state == STATE_WAIT_DATA && prefetch_pending && prefetch_issued &&
+         prefetch_victim_dirty && !prefetch_wb_issued) ? {BLOCK_SIZE{1'b1}} :
+        store_miss_mem_wr_be;
 
     // ------------------------------------------------------------------------
-    // 10. Sequential Logic (Synchronous Single-Clock Reset)
+    // 12. Sequential Logic (Synchronous Single-Clock Reset)
     // ------------------------------------------------------------------------
     integer s_idx, w_idx;
 
     always @(posedge i_clk) begin
         if (i_rst) begin
             // Synchronous Reset: invalidate all lines, clear dirty bits and FSM
-            state                <= STATE_IDLE;
-            latched_addr         <= 32'd0;
-            latched_victim_way   <= {WAY_BITS{1'b0}};
-            latched_victim_tag   <= {TAG_BITS{1'b0}};
-            latched_victim_data  <= {(BLOCK_SIZE*8){1'b0}};
-            prefetch_pending     <= 1'b0;
-            prefetch_issued      <= 1'b0;
-            prefetch_addr        <= 32'd0;
-            prefetch_set         <= {SET_BITS{1'b0}};
-            prefetch_victim_way  <= {WAY_BITS{1'b0}};
-            prefetch_tag         <= {TAG_BITS{1'b0}};
-            prefetch_victim_tag  <= {TAG_BITS{1'b0}};
-            prefetch_victim_data <= {(BLOCK_SIZE*8){1'b0}};
+            state                 <= STATE_IDLE;
+            latched_addr          <= 32'd0;
+            latched_victim_way    <= {WAY_BITS{1'b0}};
+            latched_victim_tag    <= {TAG_BITS{1'b0}};
+            latched_victim_data   <= {(BLOCK_SIZE*8){1'b0}};
+            prefetch_pending      <= 1'b0;
+            prefetch_issued       <= 1'b0;
+            prefetch_addr         <= 32'd0;
+            prefetch_set          <= {SET_BITS{1'b0}};
+            prefetch_victim_way   <= {WAY_BITS{1'b0}};
+            prefetch_tag          <= {TAG_BITS{1'b0}};
+            prefetch_victim_tag   <= {TAG_BITS{1'b0}};
+            prefetch_victim_data  <= {(BLOCK_SIZE*8){1'b0}};
             prefetch_victim_dirty <= 1'b0;
-            prefetch_wb_issued   <= 1'b0;
+            prefetch_wb_issued    <= 1'b0;
 
             for (s_idx = 0; s_idx < NUM_SETS; s_idx = s_idx + 1) begin
                 for (w_idx = 0; w_idx < NUM_WAYS; w_idx = w_idx + 1) begin
@@ -702,54 +657,50 @@ wire prefetch_block_cpu = (state == STATE_IDLE) && prefetch_pending && !prefetch
             case (state)
                 STATE_IDLE: begin
                     if (prefetch_response) begin
-                        // Prefetch response has priority over the CPU for this cycle.
-                        // If the selected victim became dirty while the request was
-                        // outstanding, discard the prefetched line rather than losing data.
-                        if (!(valid[prefetch_set][prefetch_victim_way] &&
-                              dirty[prefetch_set][prefetch_victim_way])) begin
-                            mem[prefetch_set][prefetch_victim_way]   <= i_mem_rd_data;
-                            tags[prefetch_set][prefetch_victim_way]  <= prefetch_tag;
-                            valid[prefetch_set][prefetch_victim_way] <= 1'b1;
-                            dirty[prefetch_set][prefetch_victim_way] <= 1'b0;
-                        end
-                        prefetch_pending <= 1'b0;
-                        prefetch_issued  <= 1'b0;
+                        // Prefetch response arrived from main memory!
+                        // Safely install prefetched line (dirty victim was already written back)
+                        mem[prefetch_set][prefetch_victim_way]   <= i_mem_rd_data;
+                        tags[prefetch_set][prefetch_victim_way]  <= prefetch_tag;
+                        valid[prefetch_set][prefetch_victim_way] <= 1'b1;
+                        dirty[prefetch_set][prefetch_victim_way] <= 1'b0;
+
+                        prefetch_pending      <= 1'b0;
+                        prefetch_issued       <= 1'b0;
                         prefetch_victim_dirty <= 1'b0;
-                        prefetch_wb_issued <= 1'b0;
-                        state <= STATE_IDLE;
+                        prefetch_wb_issued    <= 1'b0;
+                        state                 <= STATE_IDLE;
                     end else if (i_wen && hit) begin
                         // Store Hit: Write-back policy
-                        // Update cache line, mark as dirty, no main memory write.
                         mem[req_set][hit_way]   <= store_hit_updated_line;
                         dirty[req_set][hit_way] <= 1'b1;
                         state                   <= STATE_IDLE;
                     end else if (i_wen && !hit) begin
                         // Store Miss: Write-through, no-allocate
-                        // Directly forwarded to memory via o_mem_wr; cache unchanged.
                         state <= STATE_IDLE;
-                    end else if (i_ren && !hit) begin
+                    end else if (i_ren && !hit && !(prefetch_pending && prefetch_issued)) begin
                         // Read Miss: Must allocate a block in the set
                         latched_addr       <= i_addr;
                         latched_victim_way <= victim_way;
 
+                        // Next-line prefetch: trigger only on load miss, if not already cached
                         if (PREFETCH_EN && !prefetch_hit) begin
-                            prefetch_pending    <= 1'b1;
-                            prefetch_issued     <= 1'b0;
-                            prefetch_addr       <= current_next_line_addr;
-                            prefetch_set        <= current_next_line_set;
-                            prefetch_victim_way <= prefetch_victim_way_now;
-                            prefetch_tag        <= current_next_line_tag;
-                            prefetch_victim_tag <= tags[current_next_line_set][prefetch_victim_way_now];
-                            prefetch_victim_data <= mem[current_next_line_set][prefetch_victim_way_now];
+                            prefetch_pending      <= 1'b1;
+                            prefetch_issued       <= 1'b0;
+                            prefetch_addr         <= current_next_line_addr;
+                            prefetch_set          <= current_next_line_set;
+                            prefetch_victim_way   <= prefetch_victim_way_now;
+                            prefetch_tag          <= current_next_line_tag;
+                            prefetch_victim_tag   <= tags[current_next_line_set][prefetch_victim_way_now];
+                            prefetch_victim_data  <= mem[current_next_line_set][prefetch_victim_way_now];
                             prefetch_victim_dirty <=
                                 valid[current_next_line_set][prefetch_victim_way_now] &&
                                 dirty[current_next_line_set][prefetch_victim_way_now];
-                            prefetch_wb_issued <= 1'b0;
+                            prefetch_wb_issued    <= 1'b0;
                         end else begin
-                            prefetch_pending    <= 1'b0;
-                            prefetch_issued     <= 1'b0;
+                            prefetch_pending      <= 1'b0;
+                            prefetch_issued       <= 1'b0;
                             prefetch_victim_dirty <= 1'b0;
-                            prefetch_wb_issued <= 1'b0;
+                            prefetch_wb_issued    <= 1'b0;
                         end
 
                         if (victim_is_dirty) begin
@@ -762,7 +713,7 @@ wire prefetch_block_cpu = (state == STATE_IDLE) && prefetch_pending && !prefetch
                             state <= STATE_WAIT_DATA;
                         end
                     end else begin
-                        // Read hit or Idle: no change
+                        // Read hit, or waiting for in-flight prefetch, or Idle
                         state <= STATE_IDLE;
                     end
                 end
@@ -778,41 +729,21 @@ wire prefetch_block_cpu = (state == STATE_IDLE) && prefetch_pending && !prefetch
                 end
 
                 STATE_WAIT_DATA: begin
-                    // The prefetch read is issued exactly one cycle after the
-                    // demand read request. It is a one-cycle pulse.
+                    // Issue prefetch request one cycle after demand read
                     if (prefetch_pending && !prefetch_issued) begin
                         prefetch_issued <= 1'b1;
                     end else if (prefetch_pending && prefetch_issued &&
                                  prefetch_victim_dirty && !prefetch_wb_issued) begin
-                        // The prefetch read was launched in the previous cycle.
-                        // Write its dirty victim back before the prefetch response
-                        // installs the new line.
                         prefetch_wb_issued <= 1'b1;
                     end
 
                     if (i_mem_valid) begin
                         // Requested line has arrived from main memory!
-                        // Store line, set valid, clear dirty, set tag
                         mem[latched_set][latched_victim_way]   <= i_mem_rd_data;
                         tags[latched_set][latched_victim_way]  <= latched_tag;
                         valid[latched_set][latched_victim_way] <= 1'b1;
                         dirty[latched_set][latched_victim_way] <= 1'b0;
-
-                        // For a fully-associative cache, the demand fill and the
-                        // prefetch target share the same set. If they selected the
-                        // same way, redirect the prefetch to another way.
-                        if (prefetch_pending && (prefetch_set == latched_set) &&
-                            (prefetch_victim_way == latched_victim_way) && (NUM_WAYS > 1)) begin
-                            if (prefetch_invalid_way[0] && (latched_victim_way != 0))
-                                prefetch_victim_way <= 0;
-                            else
-                                prefetch_victim_way <= (order[latched_set][NUM_WAYS-1] == latched_victim_way) ?
-                                                       order[latched_set][PENULT_WAY] :
-                                                       order[latched_set][NUM_WAYS-1];
-                        end
-
-                        // Return to IDLE for next instruction
-                        state <= STATE_IDLE;
+                        state                                  <= STATE_IDLE;
                     end
                 end
 
