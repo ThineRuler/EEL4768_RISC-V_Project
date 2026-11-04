@@ -1,4 +1,3 @@
-`timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
 // Company: 
 // Engineer: 
@@ -274,7 +273,7 @@ assign EQ4 = ~(i_op1[3] ^ i_op2[3]);
 assign EQ_A = EQ4 & EQ3 & EQ2 & EQ1;
 
 wire LT1;
-assign LT1 =  ~i_op1[3] & i_op2[3] | (EQ4 & ~i_op1[2] & i_op2[2]) | (EQ4 & EQ3 & ~i_op1[1] & i_op2[1]) | (EQ4 & EQ3 & EQ2 & ~i_op1[0] & i_op2[0]);
+assign LT1 =  (~i_op1[3] & i_op2[3]) | (EQ4 & ~i_op1[2] & i_op2[2]) | (EQ4 & EQ3 & ~i_op1[1] & i_op2[1]) | (EQ4 & EQ3 & EQ2 & ~i_op1[0] & i_op2[0]);
 
 //GROUP#2 (BITS 4-7)
 wire EQ_B;
@@ -290,7 +289,7 @@ assign EQ8 = ~(i_op1[7] ^ i_op2[7]);
 assign EQ_B = EQ8 & EQ7 & EQ6 & EQ5;
 
 wire LT2;
-assign LT2 =  ~i_op1[7] & i_op2[7] | (EQ8 & ~i_op1[6] & i_op2[6]) | (EQ8 & EQ7 & ~i_op1[5] & i_op2[5]) | (EQ8 & EQ7 & EQ6 & ~i_op1[4] & i_op2[4]);
+assign LT2 =  (~i_op1[7] & i_op2[7]) | (EQ8 & ~i_op1[6] & i_op2[6]) | (EQ8 & EQ7 & ~i_op1[5] & i_op2[5]) | (EQ8 & EQ7 & EQ6 & ~i_op1[4] & i_op2[4]);
 
 //GROUP#3 (BITS 8-11)
 wire EQ_C;
@@ -306,7 +305,7 @@ assign EQ12= ~(i_op1[11] ^ i_op2[11]);
 assign EQ_C = EQ12 & EQ11 & EQ10 & EQ9;
 
 wire LT3;
-assign LT3 =  ~i_op1[11] & i_op2[11] | (EQ12 & ~i_op1[10] & i_op2[10]) | (EQ12 & EQ11 & ~i_op1[9] & i_op2[9]) | (EQ12 & EQ11 & EQ10 & ~i_op1[8] & i_op2[8]);
+assign LT3 =  (~i_op1[11] & i_op2[11]) | (EQ12 & ~i_op1[10] & i_op2[10]) | (EQ12 & EQ11 & ~i_op1[9] & i_op2[9]) | (EQ12 & EQ11 & EQ10 & ~i_op1[8] & i_op2[8]);
 
 //GROUP#4 (BITS 12-15)
 wire EQ_D;
@@ -322,7 +321,7 @@ assign EQ16 = ~(i_op1[15] ^ i_op2[15]);
 assign EQ_D = EQ16 & EQ15 & EQ14 & EQ13;
 
 wire LT4;
-assign LT4 =  ~i_op1[15] & i_op2[15] | (EQ16 & ~i_op1[14] & i_op2[14]) | (EQ16 & EQ15 & ~i_op1[13] & i_op2[13]) | (EQ16 & EQ15 & EQ14 & ~i_op1[12] & i_op2[12]);
+assign LT4 =  (~i_op1[15] & i_op2[15]) | (EQ16 & ~i_op1[14] & i_op2[14]) | (EQ16 & EQ15 & ~i_op1[13] & i_op2[13]) | (EQ16 & EQ15 & EQ14 & ~i_op1[12] & i_op2[12]);
 
 //GROUP#5 (BITS 16-19)
 wire EQ_E;
@@ -338,7 +337,7 @@ assign EQ20= ~(i_op1[19] ^ i_op2[19]);
 assign EQ_E = EQ20 & EQ19 & EQ18 & EQ17;
 
 wire LT5;
-assign LT5 =  ~i_op1[19] & i_op2[19] | (EQ20 & ~i_op1[18] & i_op2[18]) | (EQ20 & EQ19 & ~i_op1[17] & i_op2[17]) | (EQ20 & EQ19 & EQ18 & ~i_op1[16] & i_op2[16]);
+assign LT5 =  (~i_op1[19] & i_op2[19]) | (EQ20 & ~i_op1[18] & i_op2[18]) | (EQ20 & EQ19 & ~i_op1[17] & i_op2[17]) | (EQ20 & EQ19 & EQ18 & ~i_op1[16] & i_op2[16]);
 
 //GROUP#6 (BITS 20-23)
 wire EQ_F;
@@ -354,7 +353,7 @@ assign EQ24 = ~(i_op1[23] ^ i_op2[23]);
 assign EQ_F = EQ24 & EQ23 & EQ22 & EQ21;
 
 wire LT6;
-assign LT6 =  ~i_op1[23] & i_op2[23] | (EQ24 & ~i_op1[22] & i_op2[22]) | (EQ24 & EQ23 & ~i_op1[21] & i_op2[21]) | (EQ24 & EQ23 & EQ22 & ~i_op1[20] & i_op2[20]);
+assign LT6 =  (~i_op1[23] & i_op2[23]) | (EQ24 & ~i_op1[22] & i_op2[22]) | (EQ24 & EQ23 & ~i_op1[21] & i_op2[21]) | (EQ24 & EQ23 & EQ22 & ~i_op1[20] & i_op2[20]);
 
 //GROUP#7 (BITS 24-27)
 wire EQ_G;
@@ -370,7 +369,7 @@ assign EQ28 = ~(i_op1[27] ^ i_op2[27]);
 assign EQ_G = EQ28 & EQ27 & EQ26 & EQ25;
 
 wire LT7;
-assign LT7 =  ~i_op1[27] & i_op2[27] | (EQ28 & ~i_op1[26] & i_op2[26]) | (EQ28 & EQ27 & ~i_op1[25] & i_op2[25]) | (EQ28 & EQ27 & EQ26 & ~i_op1[24] & i_op2[24]);
+assign LT7 =  (~i_op1[27] & i_op2[27]) | (EQ28 & ~i_op1[26] & i_op2[26]) | (EQ28 & EQ27 & ~i_op1[25] & i_op2[25]) | (EQ28 & EQ27 & EQ26 & ~i_op1[24] & i_op2[24]);
 
 //GROUP#8 (BITS 28-31)
 wire EQ_H;
@@ -386,7 +385,7 @@ assign EQ32 = ~(i_op1[31] ^ i_op2[31]);
 assign EQ_H = EQ32 & EQ31 & EQ30 & EQ29;
 
 wire LT8;
-assign LT8 =  ~i_op1[31] & i_op2[31] | (EQ32 & ~i_op1[30] & i_op2[30]) | (EQ32 & EQ31 & ~i_op1[29] & i_op2[29]) | (EQ32 & EQ31 & EQ30 & ~i_op1[28] & i_op2[28]);
+assign LT8 =  (~i_op1[31] & i_op2[31]) | (EQ32 & ~i_op1[30] & i_op2[30]) | (EQ32 & EQ31 & ~i_op1[29] & i_op2[29]) | (EQ32 & EQ31 & EQ30 & ~i_op1[28] & i_op2[28]);
 
 //FINAL COMPARATOR  ANSWER
 wire LT_FINAL;
