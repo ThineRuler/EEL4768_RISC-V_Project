@@ -19,45 +19,24 @@
 //////////////////////////////////////////////////////////////////////////////////
 `default_nettype none
 
-module alu(
+module alu (
+    input  wire        i_clk,
+    input  wire        i_rst,
 
-// The arithmetic logic unit (ALU) is responsible for performing the core
-// calculations of the processor. It takes two 32-bit operands and outputs
-// a 32 bit result based on the selection operation - addition, comparison,
-// shift, or logical operation. This ALU is a purely combinational block, so
-
-    // Major operation selection.
-    // 3'b000: addition/subtraction if `i_sub` asserted
-    // 3'b001: shift left logical
-    // 3'b010: set less than
-    // 3'b011: set less than unsigned
-    // 3'b100: exclusive or
-    // 3'b101: shift right logical/arithmetic if `i_arith` asserted
-    // 3'b110: or
-    // 3'b111: and
     input  wire [ 2:0] i_opsel,
-    // When asserted, addition operations should subtract instead.
-    // This is only used for `i_opsel == 3'b000` (addition/subtraction).
     input  wire        i_sub,
-    // When asserted, comparison operations should be treated as unsigned.
-    // This is only used for branch comparisons, as the set less than unsigned
-    // mode is already specified by `i_opsel`. For branch operations, the ALU
-    // result is not used, only the comparison results.
     input  wire        i_unsigned,
-    // When asserted, right shifts should be treated as arithmetic instead of
-    // logical. This is only used for `i_opsel == 3'b101` (shift right).
     input  wire        i_arith,
-    // First 32-bit input operand.
+    input  wire        i_mext,
+    input  wire        i_advance,
+
     input  wire [31:0] i_op1,
-    // Second 32-bit input operand.
     input  wire [31:0] i_op2,
-    // 32-bit output result. Any carry out (from addition) should be ignored.
+
     output wire [31:0] o_result,
-    // Equality result. This is used downstream to determine if a
-    // branch should be taken.
     output wire        o_eq,
-   
-    output wire        o_slt
+    output wire        o_slt,
+    output wire        o_busy
 );
 //*********************************
 //  32 BIT  2'S COMPLEMENT CLA //
@@ -412,18 +391,218 @@ assign AND = i_op1 & i_op2; //OPERATION EQUATION
 //*******************
 //OPERATION SELECTION
 //********************
-assign o_result = 
-    (i_opsel == 3'b000) ? SUM: //ADD/SUB
-    (i_opsel == 3'b001) ? SL_5: //SLL
-    ((i_opsel == 3'b010) || (i_opsel == 3'b011)) ? {{31{1'b0}}, o_slt}: //SLT / SLTU
-    (i_opsel == 3'b100) ? XOR: //XOR
-    (i_opsel == 3'b101) ? (i_arith ? SA_5 : SR_5)://SRL / SRA :
-    (i_opsel == 3'b110) ? OR:
+//*********************************
+// RV32M MULTIPLIER
+//*********************************
+
+// MUL uses the low 32 bits, which are identical for signed and unsigned
+// multiplication. MULH, MULHSU, and MULHU select operand signedness below.
+wire mul_a_signed;
+wire mul_b_signed;
+wire [31:0] mul_a_mag;
+wire [31:0] mul_b_mag;
+wire mul_negative;
+
+assign mul_a_signed = (i_opsel == 3'b001) || (i_opsel == 3'b010);
+assign mul_b_signed = (i_opsel == 3'b001);
+
+assign mul_a_mag =
+    (mul_a_signed && i_op1[31]) ? (~i_op1 + 32'd1) : i_op1;
+assign mul_b_mag =
+    (mul_b_signed && i_op2[31]) ? (~i_op2 + 32'd1) : i_op2;
+
+assign mul_negative =
+    (mul_a_signed && i_op1[31]) ^ (mul_b_signed && i_op2[31]);
+
+// Generate 32 aligned partial products using constant bit wiring.
+// This avoids both the '*' operator and variable shift operators.
+wire [63:0] mul_partial [0:31];
+wire [63:0] mul_sum      [0:32];
+
+assign mul_sum[0] = 64'b0;
+
+genvar mul_i;
+genvar mul_bit;
+generate
+    for (mul_i = 0; mul_i < 32; mul_i = mul_i + 1) begin : MUL_PARTIAL_PRODUCTS
+        for (mul_bit = 0; mul_bit < 64; mul_bit = mul_bit + 1) begin : MUL_BITS
+            if ((mul_bit >= mul_i) && (mul_bit < (mul_i + 32))) begin : SET_BIT
+                assign mul_partial[mul_i][mul_bit] =
+                    mul_b_mag[mul_i] & mul_a_mag[mul_bit - mul_i];
+            end else begin : CLEAR_BIT
+                assign mul_partial[mul_i][mul_bit] = 1'b0;
+            end
+        end
+        assign mul_sum[mul_i + 1] =
+            mul_sum[mul_i] + mul_partial[mul_i];
+    end
+endgenerate
+
+wire [63:0] mul_unsigned_product;
+wire [63:0] mul_product;
+wire [31:0] mul_result;
+
+assign mul_unsigned_product = mul_sum[32];
+assign mul_product =
+    mul_negative ? (~mul_unsigned_product + 64'd1) : mul_unsigned_product;
+
+assign mul_result =
+    (i_opsel == 3'b000) ? mul_unsigned_product[31:0] :
+                          mul_product[63:32];
+
+
+//*********************************
+// RV32M RESTORING DIVIDER
+//*********************************
+localparam [1:0] DIV_IDLE = 2'b00;
+localparam [1:0] DIV_RUN  = 2'b01;
+localparam [1:0] DIV_DONE = 2'b10;
+
+reg [1:0] div_state;
+reg [5:0] div_count;
+reg [31:0] div_quotient;
+reg [32:0] div_remainder;
+reg [31:0] div_divisor;
+reg        div_signed;
+reg        div_is_rem;
+reg        div_quotient_negative;
+reg        div_remainder_negative;
+reg [31:0] div_result_reg;
+
+wire [32:0] div_shifted_remainder;
+wire [31:0] div_shifted_quotient;
+wire [32:0] div_subtracted_remainder;
+wire        div_step_take;
+wire [32:0] div_next_remainder;
+wire [31:0] div_next_quotient;
+wire [31:0] div_corrected_quotient;
+wire [31:0] div_corrected_remainder;
+wire [31:0] div_abs_op1;
+wire [31:0] div_abs_op2;
+wire        div_request;
+
+assign div_request = i_mext && i_opsel[2];
+assign div_abs_op1 =
+    (i_opsel[0] == 1'b0 && i_op1[31]) ? (~i_op1 + 32'd1) : i_op1;
+assign div_abs_op2 =
+    (i_opsel[0] == 1'b0 && i_op2[31]) ? (~i_op2 + 32'd1) : i_op2;
+
+assign div_shifted_remainder = {div_remainder[31:0], div_quotient[31]};
+assign div_shifted_quotient  = {div_quotient[30:0], 1'b0};
+assign div_subtracted_remainder =
+    div_shifted_remainder - {1'b0, div_divisor};
+assign div_step_take = ~div_subtracted_remainder[32];
+assign div_next_remainder =
+    div_step_take ? div_subtracted_remainder : div_shifted_remainder;
+assign div_next_quotient =
+    {div_quotient[30:0], div_step_take};
+
+assign div_corrected_quotient =
+    div_quotient_negative ? (~div_next_quotient + 32'd1) : div_next_quotient;
+assign div_corrected_remainder =
+    div_remainder_negative ? (~div_next_remainder[31:0] + 32'd1) :
+                             div_next_remainder[31:0];
+
+always @(posedge i_clk) begin
+    if (i_rst) begin
+        div_state <= DIV_IDLE;
+        div_count <= 6'd0;
+        div_quotient <= 32'd0;
+        div_remainder <= 33'd0;
+        div_divisor <= 32'd0;
+        div_signed <= 1'b0;
+        div_is_rem <= 1'b0;
+        div_quotient_negative <= 1'b0;
+        div_remainder_negative <= 1'b0;
+        div_result_reg <= 32'd0;
+    end else begin
+        case (div_state)
+            DIV_IDLE: begin
+                if (div_request) begin
+                    div_signed <= ~i_opsel[0];
+                    div_is_rem <= i_opsel[1];
+                    div_quotient_negative <= (~i_opsel[0]) &&
+                                             (i_op1[31] ^ i_op2[31]);
+                    div_remainder_negative <= (~i_opsel[0]) && i_op1[31];
+                    div_count <= 6'd0;
+                    div_remainder <= 33'd0;
+
+                    if (i_op2 == 32'd0) begin
+                        div_result_reg <= i_opsel[1] ? i_op1 : 32'hFFFFFFFF;
+                        div_state <= DIV_DONE;
+                    end else if ((i_opsel == 3'b100) &&
+                                 (i_op1 == 32'h80000000) &&
+                                 (i_op2 == 32'hFFFFFFFF)) begin
+                        div_result_reg <= 32'h80000000;
+                        div_state <= DIV_DONE;
+                    end else if ((i_opsel == 3'b110) &&
+                                 (i_op1 == 32'h80000000) &&
+                                 (i_op2 == 32'hFFFFFFFF)) begin
+                        div_result_reg <= 32'd0;
+                        div_state <= DIV_DONE;
+                    end else begin
+                        div_quotient <= div_abs_op1;
+                        div_divisor <= div_abs_op2;
+                        div_state <= DIV_RUN;
+                    end
+                end
+            end
+
+            DIV_RUN: begin
+                div_remainder <= div_next_remainder;
+                div_quotient <= div_next_quotient;
+                div_count <= div_count + 6'd1;
+
+                if (div_count == 6'd31) begin
+                    div_result_reg <= div_is_rem ?
+                        div_corrected_remainder : div_corrected_quotient;
+                    div_state <= DIV_DONE;
+                end
+            end
+
+            DIV_DONE: begin
+                if (i_advance)
+                    div_state <= DIV_IDLE;
+            end
+
+            default: begin
+                div_state <= DIV_IDLE;
+            end
+        endcase
+    end
+end
+
+wire [31:0] base_result;
+
+
+assign base_result =
+    (i_opsel == 3'b000) ? SUM :
+    (i_opsel == 3'b001) ? SL_5 :
+    ((i_opsel == 3'b010) || (i_opsel == 3'b011)) ? {{31{1'b0}}, o_slt} :
+    (i_opsel == 3'b100) ? XOR :
+    (i_opsel == 3'b101) ? (i_arith ? SA_5 : SR_5) :
+    (i_opsel == 3'b110) ? OR :
     (i_opsel == 3'b111) ? AND : 32'b0;
 
-assign o_slt = i_unsigned ? SLTU : SLT;
-    
-assign o_eq = ~(|(i_op1 ^ i_op2));
+// Select RV32I, multiply, or the held multi-cycle divide result.
+assign o_result = i_mext ?
+    (i_opsel[2] ? div_result_reg :
+                  mul_result) :
+    base_result;
+
+assign o_busy = div_request && (div_state != DIV_DONE);
+
+// Set-less-than output:
+// - funct3 010 selects signed comparison.
+// - funct3 011 selects unsigned comparison.
+// - For branch comparisons using the ADD/SUB datapath, i_unsigned
+//   selects signed or unsigned comparison.
+// - Other ALU operations do not use o_slt.
+assign o_slt =
+    (i_opsel == 3'b010) ? SLT :
+    (i_opsel == 3'b011) ? SLTU :
+                          1'b0;
+assign o_eq  = ~(|(i_op1 ^ i_op2));
 
 
 

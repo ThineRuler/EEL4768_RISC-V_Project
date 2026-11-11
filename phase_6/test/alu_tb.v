@@ -194,7 +194,7 @@ module alu_tb;
         // mul (funct3 = 000)
         check_m_mul(3'b000, 32'd11, 32'd13, 32'd143, "mul 11 * 13");
         check_m_mul(3'b000, 32'hFFFFFFFF, 32'hFFFFFFFF, 32'h00000001, "mul -1 * -1");
-        check_m_mul(3'b000, 32'd100000, 32'd500000, 32'd50000000000 % (2**32), "mul large");
+        check_m_mul(3'b000, 32'd100000, 32'd500000, 32'hA43B7400, "mul large");
 
         // mulh (funct3 = 001) signed * signed
         check_m_mul(3'b001, 32'hFFFFFFFF, 32'hFFFFFFFF, 32'h00000000, "mulh -1 * -1");
@@ -203,7 +203,7 @@ module alu_tb;
 
         // mulhsu (funct3 = 010) signed * unsigned
         check_m_mul(3'b010, 32'hFFFFFFFF, 32'hFFFFFFFF, 32'hFFFFFFFF, "mulhsu -1 * 0xFFFFFFFF");
-        check_m_mul(3'b010, 32'd5, 32'hFFFFFFFF, 32'd0, "mulhsu 5 * 0xFFFFFFFF");
+        check_m_mul(3'b010, 32'd5, 32'hFFFFFFFF, 32'd4, "mulhsu 5 * 0xFFFFFFFF");
 
         // mulhu (funct3 = 011) unsigned * unsigned
         check_m_mul(3'b011, 32'hFFFFFFFF, 32'hFFFFFFFF, 32'hFFFFFFFE, "mulhu 0xFFFFFFFF * 0xFFFFFFFF");
