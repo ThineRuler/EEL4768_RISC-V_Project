@@ -76,7 +76,15 @@ module fpu_tb;
             frs3    <= in_frs3;
             xrs1    <= in_xrs1;
             @(posedge clk);
-            while (busy) @(posedge clk);
+            begin : wait_for_fpu
+                integer elapsed;
+                elapsed = 0;
+                while (busy && elapsed < 32) begin
+                    @(posedge clk);
+                    elapsed = elapsed + 1;
+                end
+                if (busy) $fatal(1, "FPU did not finish");
+            end
             #1; // Output valid
         end
     endtask
@@ -122,6 +130,120 @@ module fpu_tb;
                          name, int_result, exp_res, fflags, exp_flags);
                 fail_count = fail_count + 1;
             end
+        end
+    endtask
+
+    task check_trap(input expected, input [127:0] name);
+        begin
+            if (rm_trap === expected) begin
+                $display("[PASS] Trap: %0s", name);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("[FAIL] Trap: %0s, got %b expected %b", name, rm_trap, expected);
+                fail_count = fail_count + 1;
+            end
+        end
+    endtask
+
+
+    task conversion_case(
+        input to_fp,
+        input unsigned_operand,
+        input [2:0] mode,
+        input [31:0] fp_input, int_input, result,
+        input [4:0] flags,
+        input [127:0] name
+    );
+        begin
+            // Clear accrued flags so each check observes this conversion alone.
+            step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+            commit_inst();
+            step_inst({(to_fp ? 7'b1101000 : 7'b1100000), 4'd0, unsigned_operand,
+                       5'd1, mode, 5'd2, 7'b1010011}, fp_input, 0, 0, int_input);
+            if (to_fp)
+                check_fp(result, flags, name);
+            else
+                check_int(result, flags, name);
+            commit_inst();
+        end
+    endtask
+
+    reg round_sign;
+    reg [2:0] round_mode;
+    reg signed [9:0] round_exp;
+    reg [26:0] round_sig;
+    wire [31:0] round_fp;
+    wire [4:0] round_flags;
+    fpu_round round_probe (
+        .i_sign(round_sign), .i_rm(round_mode), .i_to_int(1'b0),
+        .i_exp(round_exp), .i_mag_grs({8'd0, round_sig}),
+        .o_fp_result(round_fp), .o_int_mag(), .o_flags(round_flags)
+    );
+
+    task fp_round_case(
+        input sign, input [2:0] mode, input signed [9:0] exp,
+        input [23:0] sig, input [31:0] result, input [4:0] flags,
+        input [127:0] name
+    );
+        begin
+            round_sign = sign;
+            round_mode = mode;
+            round_exp = exp;
+            round_sig = {sig, 3'b000};
+            #1;
+            if (round_fp === result && round_flags === flags) begin
+                $display("[PASS] Round: %0s", name);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("[FAIL] Round: %0s -> %h flags %b (expected %h flags %b)",
+                         name, round_fp, round_flags, result, flags);
+                fail_count = fail_count + 1;
+            end
+        end
+    endtask
+
+
+    task div_sqrt_case(
+        input sqrt_op,
+        input [2:0] mode,
+        input [31:0] a, b, expected,
+        input [4:0] expected_flags,
+        input expect_busy,
+        input [127:0] name
+    );
+        integer busy_cycles;
+        begin
+            step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+            commit_inst();
+            @(negedge clk);
+            inst = {(sqrt_op ? 7'b0101100 : 7'b0001100),
+                    (sqrt_op ? 5'd0 : 5'd2), 5'd1, mode, 5'd3, 7'b1010011};
+            frs1 = a;
+            frs2 = b;
+            valid = 1'b1;
+            busy_cycles = 0;
+            #1;
+            if (busy !== expect_busy)
+                $fatal(1, "%0s: wrong busy signal on entry", name);
+            while (busy && busy_cycles < 32) begin
+                if (fflags !== 5'd0)
+                    $fatal(1, "%0s: flags visible before completion", name);
+                @(negedge clk);
+                busy_cycles = busy_cycles + 1;
+            end
+            if (busy || (expect_busy && busy_cycles < 2))
+                $fatal(1, "%0s: wrong busy duration", name);
+            check_fp(expected, expected_flags, name);
+            // Emulate a cache freeze after the result is ready.
+            repeat (4) begin
+                @(negedge clk);
+                if (busy !== 1'b0 || fp_result !== expected || fflags !== expected_flags)
+                    $fatal(1, "%0s: result changed before advance", name);
+            end
+            commit_inst();
+            step_inst({12'h001, 5'd0, 3'b010, 5'd4, 7'b1110011}, 0, 0, 0, 0);
+            check_int({27'd0, expected_flags}, expected_flags, "flags on advance");
+            commit_inst();
         end
     endtask
 
@@ -197,9 +319,50 @@ module fpu_tb;
         check_int(32'd0, 5'b00000, "flt.s -0 < +0 -> 0");
         commit_inst();
 
+        // Sign injection changes only the sign, even for a signaling NaN.
+        step_inst(32'b0010000_00010_00001_001_00011_1010011, FP_SNAN, FP_PLUS_ZERO, 32'd0, 32'd0);
+        check_fp(32'hFF800001, 5'b00000, "fsgnjn NaN bits");
+        commit_inst();
+
+        step_inst(32'b1010000_00010_00001_010_00101_1010011, FP_CANON_NAN, FP_ONE, 32'd0, 32'd0);
+        check_int(32'd0, 5'b00000, "feq quiet NaN");
+        commit_inst();
+
+        step_inst(32'b1010000_00010_00001_000_00101_1010011, FP_NEG_SIX_PT_25, FP_MINUS_ZERO, 32'd0, 32'd0);
+        check_int(32'd1, 5'b00000, "fle negative");
+        commit_inst();
+
+        step_inst(32'b0010100_00010_00001_000_00011_1010011, FP_PLUS_ZERO, FP_MINUS_ZERO, 32'd0, 32'd0);
+        check_fp(FP_MINUS_ZERO, 5'b00000, "fmin signed zero");
+        commit_inst();
+
+        step_inst(32'b0010100_00010_00001_001_00011_1010011, FP_MINUS_ZERO, FP_PLUS_ZERO, 32'd0, 32'd0);
+        check_fp(FP_PLUS_ZERO, 5'b00000, "fmax signed zero");
+        commit_inst();
+
+        step_inst(32'b0010100_00010_00001_000_00011_1010011, FP_ONE, FP_CANON_NAN, 32'd0, 32'd0);
+        check_fp(FP_ONE, 5'b00000, "fmin one NaN");
+        commit_inst();
+
+        step_inst(32'b0010100_00010_00001_001_00011_1010011, 32'h7FC00001, FP_CANON_NAN, 32'd0, 32'd0);
+        check_fp(FP_CANON_NAN, 5'b00000, "fmax two NaNs");
+        commit_inst();
+
+        // An instruction held in EX reports NV but must not commit it yet.
+        step_inst(32'b0010100_00010_00001_000_00011_1010011, FP_SNAN, FP_ONE, 32'd0, 32'd0);
+        check_fp(FP_ONE, 5'b10000, "fmin sNaN");
+        repeat (2) @(negedge clk);
+        valid = 1'b0;
+        #1;
+        check_int(32'd0, 5'b00000, "uncommitted NV");
+
         // flt.s with NaN operand -> raises NV flag (bit 4: 5'b10000)
         step_inst(32'b1010000_00010_00001_001_00101_1010011, FP_ONE, FP_CANON_NAN, 32'd0, 32'd0);
         check_int(32'd0, 5'b10000, "flt.s 1.0 < NaN -> 0 with NV flag");
+        commit_inst();
+
+        step_inst(32'b1110000_00000_00001_001_00101_1010011, FP_CANON_NAN, 32'd0, 32'd0, 32'd0);
+        check_int(32'h200, 5'b10000, "NV stays accrued");
         commit_inst();
 
         $display("\n==================================================");
@@ -224,6 +387,37 @@ module fpu_tb;
         check_fp(FP_TWO, 5'b10001, "fcvt.s.w 2 -> 2.0");
         commit_inst();
 
+        conversion_case(1'b0, 1'b0, 3'd0, 32'h40200000, 32'h0, 32'h00000002, 5'b00001, "RNE 2.5 to 2");
+        conversion_case(1'b0, 1'b0, 3'd4, 32'h40200000, 32'h0, 32'h00000003, 5'b00001, "RMM 2.5 to 3");
+        conversion_case(1'b0, 1'b0, 3'd2, 32'hc0200000, 32'h0, 32'hfffffffd, 5'b00001, "RDN -2.5 to -3");
+        conversion_case(1'b0, 1'b0, 3'd3, 32'hc0200000, 32'h0, 32'hfffffffe, 5'b00001, "RUP -2.5 to -2");
+        conversion_case(1'b0, 1'b1, 3'd1, 32'hbf000000, 32'h0, 32'h0, 5'b00001, "RTZ unsigned -0.5");
+        conversion_case(1'b0, 1'b1, 3'd2, 32'hbf000000, 32'h0, 32'h0, 5'b10000, "RDN unsigned -0.5");
+        conversion_case(1'b0, 1'b0, 3'd0, 32'hcf000000, 32'h0, 32'h80000000, 5'b00000, "exact INT_MIN");
+        conversion_case(1'b0, 1'b0, 3'd0, 32'h4f000000, 32'h0, 32'h7fffffff, 5'b10000, "signed overflow");
+        conversion_case(1'b0, 1'b1, 3'd0, 32'h4f7fffff, 32'h0, 32'hffffff00, 5'b00000, "large uint exact");
+        conversion_case(1'b0, 1'b1, 3'd0, 32'h4f800000, 32'h0, 32'hffffffff, 5'b10000, "uint overflow");
+        conversion_case(1'b0, 1'b1, 3'd0, 32'hffc00001, 32'h0, 32'hffffffff, 5'b10000, "negative NaN");
+        conversion_case(1'b0, 1'b0, 3'd3, 32'h00000001, 32'h0, 32'h1, 5'b00001, "subnormal to 1");
+        conversion_case(1'b1, 1'b0, 3'd0, 32'h0, 32'h80000000, 32'hcf000000, 5'b00000, "INT_MIN to FP");
+        conversion_case(1'b1, 1'b1, 3'd0, 32'h0, 32'hffffffff, 32'h4f800000, 5'b00001, "UINT_MAX RNE");
+        conversion_case(1'b1, 1'b1, 3'd1, 32'h0, 32'hffffffff, 32'h4f7fffff, 5'b00001, "UINT_MAX RTZ");
+        conversion_case(1'b1, 1'b0, 3'd0, 32'h0, 32'h01000001, 32'h4b800000, 5'b00001, "int tie RNE");
+        conversion_case(1'b1, 1'b0, 3'd4, 32'h0, 32'h01000001, 32'h4b800001, 5'b00001, "int tie RMM");
+
+        // Exercise dynamic rounding with a mode that changes the result.
+        step_inst({12'h002, 5'd4, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        conversion_case(1'b0, 1'b0, 3'd7, 32'h40200000, 32'd0, 32'd3, 5'b00001, "dynamic RMM");
+        step_inst({12'h002, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+
+        fp_round_case(1'b0, 3'd0, -10'sd149, 24'h800000, 32'h00000001, 5'b00000, "exact subnormal");
+        fp_round_case(1'b1, 3'd0, -10'sd150, 24'h800000, 32'h80000000, 5'b00011, "tiny tie to -0");
+        fp_round_case(1'b0, 3'd0, -10'sd127, 24'hffffff, 32'h00800000, 5'b00001, "tiny becomes normal");
+        fp_round_case(1'b0, 3'd1,  10'sd128, 24'h800000, 32'h7f7fffff, 5'b00101, "RTZ overflow");
+
+
         $display("\n==================================================");
         $display("      TESTING FP ARITHMETIC, FMA & ROUNDING       ");
         $display("==================================================");
@@ -247,6 +441,89 @@ module fpu_tb;
         commit_inst();
 
         // Inexact Rounding Test from Spec Section 4.5.2 Breakdown:
+        // Check arithmetic flags per instruction, independent of earlier cases.
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0000100_00010_00001_000_00011_1010011, FP_ONE, FP_TWO, 0, 0);
+        check_fp(32'hbf800000, 5'b00000, "fsub 1 - 2");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst({5'd3, 2'b00, 5'd2, 5'd1, 3'b000, 5'd4, 7'b1000111}, FP_TWO, FP_THREE, FP_FOUR, 0);
+        check_fp(FP_TWO, 5'b00000, "fmsub 6 - 4");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst({5'd3, 2'b00, 5'd2, 5'd1, 3'b000, 5'd4, 7'b1001011}, FP_TWO, FP_THREE, FP_FOUR, 0);
+        check_fp(32'hc0000000, 5'b00000, "fnmsub -6 + 4");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst({5'd3, 2'b00, 5'd2, 5'd1, 3'b000, 5'd4, 7'b1001111}, FP_TWO, FP_THREE, FP_FOUR, 0);
+        check_fp(32'hc1200000, 5'b00000, "fnmadd -6 - 4");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst({5'd3, 2'b00, 5'd2, 5'd1, 3'b000, 5'd4, 7'b1000011}, 32'h3f800001, 32'h3f7ffffe, 32'hbf800000, 0);
+        check_fp(32'ha8800000, 5'b00000, "one rounding");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0001000_00010_00001_000_00011_1010011, FP_MINUS_ZERO, FP_TWO, 0, 0);
+        check_fp(FP_MINUS_ZERO, 5'b00000, "fmul negative 0");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0000100_00010_00001_010_00011_1010011, FP_ONE, FP_ONE, 0, 0);
+        check_fp(FP_MINUS_ZERO, 5'b00000, "RDN cancel zero");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0000000_00010_00001_000_00011_1010011, FP_POS_SUBNORM, FP_POS_SUBNORM, 0, 0);
+        check_fp(32'h00000002, 5'b00000, "exact subnormals");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0000100_00010_00001_001_00011_1010011, FP_ONE, FP_POS_SUBNORM, 0, 0);
+        check_fp(32'h3f7fffff, 5'b00001, "distant subtract");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0001000_00010_00001_000_00011_1010011, FP_POS_SUBNORM, 32'h3f000000, 0, 0);
+        check_fp(FP_PLUS_ZERO, 5'b00011, "underflow tie");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0001000_00010_00001_001_00011_1010011, 32'h7f7fffff, FP_TWO, 0, 0);
+        check_fp(32'h7f7fffff, 5'b00101, "RTZ overflow");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst(32'b0000000_00010_00001_000_00011_1010011, FP_PLUS_INF, FP_MINUS_INF, 0, 0);
+        check_fp(FP_CANON_NAN, 5'b10000, "infinity cancel");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+        step_inst({5'd3, 2'b00, 5'd2, 5'd1, 3'b000, 5'd4, 7'b1000011}, FP_PLUS_INF, FP_PLUS_ZERO, FP_CANON_NAN, 0);
+        check_fp(FP_CANON_NAN, 5'b10000, "inf*0 with qNaN");
+        commit_inst();
+
+        step_inst({12'h001, 5'd0, 3'b101, 5'd0, 7'b1110011}, 0, 0, 0, 0);
+        commit_inst();
+
+
         // 1.0 / 3.0 under RNE -> 0x3EAAAAAB (NX)
         step_inst(32'b0001100_00010_00001_000_00011_1010011, FP_ONE, FP_THREE, 32'd0, 32'd0);
         check_fp(32'h3EAAAAAB, 5'b00001, "fdiv.s 1.0 / 3.0 under RNE");
@@ -272,35 +549,88 @@ module fpu_tb;
         check_fp(FP_CANON_NAN, 5'b11001, "fsqrt.s -1.0 -> canonical NaN (NV accrued)");
         commit_inst();
 
+        div_sqrt_case(1'b0, 3'd0, FP_ONE, FP_THREE, 32'h3eaaaaab, 5'b00001, 1'b1, "divide done hold");
+        div_sqrt_case(1'b1, 3'd3, FP_TWO, 0, 32'h3fb504f4, 5'b00001, 1'b1, "sqrt2 RUP");
+        div_sqrt_case(1'b1, 3'd0, 32'h00000002, 0, 32'h1a800000, 5'b00000, 1'b1, "subnormal square");
+        div_sqrt_case(1'b1, 3'd0, FP_MINUS_ZERO, FP_SNAN, FP_MINUS_ZERO, 5'b00000, 1'b0, "sqrt -0");
+        div_sqrt_case(1'b1, 3'd0, FP_MINUS_INF, 0, FP_CANON_NAN, 5'b10000, 1'b0, "sqrt -inf");
+        div_sqrt_case(1'b0, 3'd0, FP_POS_SUBNORM, FP_TWO, FP_PLUS_ZERO, 5'b00011, 1'b1, "tiny divide tie");
+        div_sqrt_case(1'b0, 3'd3, FP_POS_SUBNORM, FP_TWO, FP_POS_SUBNORM, 5'b00011, 1'b1, "tiny divide RUP");
+        div_sqrt_case(1'b0, 3'd0, FP_ONE, FP_MINUS_ZERO, FP_MINUS_INF, 5'b01000, 1'b0, "divide by -0");
+        div_sqrt_case(1'b0, 3'd0, FP_PLUS_INF, FP_PLUS_ZERO, FP_PLUS_INF, 5'b00000, 1'b0, "inf / zero");
+        div_sqrt_case(1'b0, 3'd0, FP_PLUS_ZERO, FP_PLUS_ZERO, FP_CANON_NAN, 5'b10000, 1'b0, "zero / zero");
+        div_sqrt_case(1'b0, 3'd0, FP_ONE, FP_MINUS_INF, FP_MINUS_ZERO, 5'b00000, 1'b0, "one / -inf");
+
         $display("\n==================================================");
         $display("          TESTING CSR TIMING & TRAPS              ");
         $display("==================================================");
-        // Test csrrw x5, frm, 1 (sets frm to RTZ = 1)
-        step_inst({12'h002, 5'd0, 3'b001, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'd1);
-        check_int(32'd0, 5'b11001, "csrrw reads old frm (0)");
-        // Commit write
+        // Establish a known fcsr independent of which arithmetic tests ran.
+        step_inst({12'h003, 5'd0, 3'b101, 5'd0, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'd0);
         commit_inst();
 
-        // Read frm back to confirm it was written on advance
-        step_inst({12'h002, 5'd0, 3'b010, 5'd6, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'd0);
-        check_int(32'd1, 5'b11001, "csrrs reads updated frm (1)");
+        step_inst({12'h003, 5'd1, 3'b001, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'hffffffa3);
+        check_int(32'h0, 5'b00011, "csrrw fcsr");
+        repeat (3) @(negedge clk);
+        check_int(32'h0, 5'b00011, "held CSR read");
         commit_inst();
 
-        // Set frm to reserved value 5 (3'b101)
-        step_inst({12'h002, 5'd0, 3'b001, 5'd0, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'd5);
+        step_inst({12'h002, 5'd0, 3'b010, 5'd6, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h5, 5'b00011, "read frm alias");
         commit_inst();
 
-        // Execute instruction with dynamic rounding mode (rm = 111): must assert o_rm_trap!
+        step_inst({12'h001, 5'd1, 3'b010, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h10);
+        check_int(32'h3, 5'b10011, "csrrs flags");
+        commit_inst();
+
+        step_inst({12'h001, 5'd1, 3'b011, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h2);
+        check_int(32'h13, 5'b10001, "csrrc flags");
+        commit_inst();
+
+        step_inst({12'h002, 5'd1, 3'b101, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h5, 5'b10001, "csrrwi frm");
+        commit_inst();
+
+        step_inst({12'h001, 5'd4, 3'b110, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h11, 5'b10101, "csrrsi flags");
+        commit_inst();
+
+        step_inst({12'h001, 5'd16, 3'b111, 5'd5, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h15, 5'b00101, "csrrci flags");
+        commit_inst();
+
+        step_inst({12'h003, 5'd0, 3'b010, 5'd6, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'hffffffff);
+        check_int(32'h25, 5'b00101, "read whole fcsr");
+        commit_inst();
+
+        step_inst({12'h002, 5'd5, 3'b101, 5'd0, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h1, 5'b00101, "reserved frm");
+        commit_inst();
+
+        // A reserved frm only traps a valid instruction that uses dynamic rm.
         step_inst(32'b0000000_00010_00001_111_00011_1010011, FP_ONE, FP_TWO, 32'd0, 32'd0);
-        #1;
-        if (rm_trap === 1'b1) begin
-            $display("[PASS] FPU: Dynamic rm with reserved frm (5) asserted o_rm_trap");
-            pass_count = pass_count + 1;
-        end else begin
-            $display("[FAIL] FPU: o_rm_trap was NOT asserted on reserved dynamic frm!");
-            fail_count = fail_count + 1;
-        end
+        check_trap(1'b1, "reserved dynamic");
         commit_inst();
+
+        step_inst(32'b0000000_00010_00001_000_00011_1010011, FP_ONE, FP_TWO, 32'd0, 32'd0);
+        check_trap(1'b0, "static RNE");
+        commit_inst();
+
+        step_inst(32'b1010000_00010_00001_010_00101_1010011, FP_ONE, FP_ONE, 32'd0, 32'd0);
+        check_trap(1'b0, "compare not rm");
+        commit_inst();
+
+        step_inst({12'h003, 5'd0, 3'b010, 5'd6, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'ha5, 5'b00101, "trap preserved CSR");
+        commit_inst();
+
+        step_inst({12'h002, 5'd4, 3'b101, 5'd0, 7'b1110011}, 32'd0, 32'd0, 32'd0, 32'h0);
+        check_int(32'h5, 5'b00101, "valid frm");
+        commit_inst();
+
+        step_inst(32'b1100000_00000_00001_111_00101_1010011, FP_ONE, 32'd0, 32'd0, 32'd0);
+        check_trap(1'b0, "valid dynamic rm");
+        commit_inst();
+
 
         $display("\n==================================================");
         $display("                 SUMMARY REPORT                   ");
