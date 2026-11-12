@@ -38,11 +38,21 @@ module decoder (
     // When asserted, the second operand is the immediate.
     output wire        o_op2_sel,
     // Major opsel for the ALU. See ALU documentation for the encoding.
-    output wire [ 2:0] o_alu_opsel,
+    output wire[2:0] o_alu_opsel,
+    output wire o_mext,
+    output wire o_fpu,
+   
+    
     // Minor opsel flags for the ALU. See ALU documentation for the encoding.
     output wire        o_alu_sub,
     output wire        o_alu_unsigned,
     output wire        o_alu_arith,
+    output wire        o_frs1_en,
+    output wire        o_frs2_en,
+    output wire        o_frs3_en,
+    output wire [4:0]  o_rs3,
+    output wire        o_frd_en,
+
     // If asserted, the instruction is a branch instruction and the PC should
     // be updated to the target address if the branch condition is met.
     output wire        o_branch,
@@ -79,10 +89,12 @@ module decoder (
     // [1] = immediate
     // [2] = PC + 4
     // [3] = memory
-    output wire [ 3:0] o_rd_sel,
+    output wire [ 4:0] o_rd_sel,
     // If asserted, the PC jumps to the target address calculated by the ALU
     // rather than directly to the PC + immediate. This is used for JALR.
     output wire        o_pc_sel
+
+   
 );
     // Your implementation goes under here
     // ------------------------------------
@@ -102,15 +114,27 @@ module decoder (
     localparam OPCODE_R_TYPE = 7'b0110011;  // R-type instructions: add, sub, sll, slt, sltu, xor, srl, sra, or, and
     localparam OPCODE_I_TYPE = 7'b0010011;  // I-type instructions: addi, slli, slti, sltiu, xori, srli, srai, ori, andi
     localparam OPCODE_LOAD   = 7'b0000011;  // I-type load instructions: lb, lh, lw, lbu, lhu
+    localparam OPCODE_LOAD_FP = 7'b0000111; 
     localparam OPCODE_STORE  = 7'b0100011;  // S-type instructions: sb, sh, sw
+    localparam OPCODE_STORE_FP = 7'b0100111;
+    localparam OPCODE_OP_FP = 7'b1010011;
     localparam OPCODE_BRANCH = 7'b1100011;  // B-type instructions: beq, bne, blt, bge, bltu, bgeu
     localparam OPCODE_LUI    = 7'b0110111;  // U-type instruction: lui
     localparam OPCODE_AUIPC  = 7'b0010111;  // U-type instruction: auipc
     localparam OPCODE_JAL    = 7'b1101111;  // J-type instruction: jal
     localparam OPCODE_JALR   = 7'b1100111;  // I-type instruction: jalr
     localparam OPCODE_SYSTEM = 7'b1110011;  // System instruction: ebreak
-
+    localparam OPCODE_FMADD  = 7'b1000011; 
+    localparam OPCODE_FMSUB  = 7'b1000111;
+    localparam OPCODE_FNMSUB = 7'b1001011;
+    localparam OPCODE_FNMADD = 7'b1001111;
     // Internal signals driven by combination logic (AI generated)
+    reg r_mext;
+    reg r_fpu;
+    reg r_frs1_en;
+    reg r_frs2_en;
+    reg r_frs3_en;
+    reg r_frd_en;
     reg        r_legal;
     reg        r_halt;
     reg        r_rd_wen;       // 1 if instruction writes to rd
@@ -133,12 +157,18 @@ module decoder (
     reg        r_dmem_memh;
     reg        r_dmem_memw;
     reg        r_dmem_memu;
-    reg [ 3:0] r_rd_sel;
+    reg [4:0]  r_rd_sel;
     reg        r_pc_sel;
 
     // Combinational decoder logic
     always @(*) begin
         // Default values for all outputs
+        r_mext = 1'b0;
+        r_fpu = 1'b0;
+        r_frs1_en = 1'b0;
+        r_frs2_en = 1'b0;
+        r_frs3_en = 1'b0;
+        r_frd_en = 1'b0;
         r_legal = 1'b0;
         r_halt = 1'b0;
         r_rd_wen = 1'b0;
@@ -146,7 +176,9 @@ module decoder (
         r_op1_sel = 1'b0;
         r_op2_sel = 1'b0;
         r_alu_opsel = 3'b000;
-        r_alu_sub = 1'b0;
+        // Major opsel for the ALU. See ALU documentation for the encoding.
+   
+   
         r_alu_unsigned = 1'b0;
         r_alu_arith = 1'b0;
         r_branch = 1'b0;
@@ -161,14 +193,14 @@ module decoder (
         r_dmem_memh = 1'b0;
         r_dmem_memw = 1'b0;
         r_dmem_memu = 1'b0;
-        r_rd_sel = 4'b0000;
+        r_rd_sel = 5'b00000;
         r_pc_sel = 1'b0;
 
         case (opcode)
             OPCODE_R_TYPE: begin // Register-Register Arithmetic/Logic
                 r_imm_format = 6'b000001; // R-type
                 r_rd_wen     = 1'b1;
-                r_rd_sel     = 4'b0001;   // ALU result
+                r_rd_sel     = 5'b0001;   // ALU result
                 r_alu_opsel  = funct3;
     
                 // Check legal funct7 variations:
@@ -189,10 +221,17 @@ module decoder (
                                 r_legal     = 1'b1;
                                 r_alu_arith = 1'b1;
                             end
+
                             default: r_legal = 1'b0;
                         endcase
                     end
-                    default: r_legal = 1'b0;
+                     7'b0000001: begin
+                            r_legal = 1'b1;
+                            r_mext = 1'b1;
+                            end
+                    default:begin
+                     r_legal = 1'b0;
+                     end
                 endcase
             end
     
@@ -200,7 +239,7 @@ module decoder (
                 r_imm_format = 6'b000010; // I-type
                 r_rd_wen     = 1'b1;
                 r_op2_sel    = 1'b1;      // Operand 2 is immediate
-                r_rd_sel     = 4'b0001;   // ALU result
+                r_rd_sel     = 5'b0001;   // ALU result
                 r_alu_opsel  = funct3;
     
                 case (funct3)
@@ -229,11 +268,12 @@ module decoder (
     
             OPCODE_LOAD: begin // Load instructions
                 r_imm_format = 6'b000010; // I-type
+                r_legal      = 1'b0;
                 r_rd_wen     = 1'b1;
                 r_op2_sel    = 1'b1;      // ALU adds immediate to rs1
                 r_alu_opsel  = 3'b000;    // ADD address
                 r_dmem_ren   = 1'b1;      // Read memory
-                r_rd_sel     = 4'b1000;   // Writeback from memory
+                r_rd_sel     = 5'b01000;   // Writeback from memory
     
                 case (funct3)
                     3'b000: begin // lb
@@ -251,6 +291,7 @@ module decoder (
                         r_dmem_memw = 1'b1;
                         r_dmem_align= 2'b11;
                     end
+                   
                     3'b100: begin // lbu
                         r_legal     = 1'b1;
                         r_dmem_memb = 1'b1;
@@ -263,9 +304,25 @@ module decoder (
                         r_dmem_memu = 1'b1;
                         r_dmem_align= 2'b01;
                     end
-                    default: r_legal = 1'b0;
+                    default:begin 
+                     r_legal = 1'b0;
+                     end
+                
                 endcase
             end
+            OPCODE_LOAD_FP: begin 
+            r_imm_format = 6'b000010;
+            r_legal      = (funct3 == 3'b010);
+            r_rd_wen     = 1'b0;
+            r_rd_sel     = 5'b01000;
+            r_frd_en     = r_legal;
+            r_fpu        = 1'b0;
+            r_op2_sel    = 1'b1;
+            r_alu_opsel  = 3'b000;
+            r_dmem_ren   = r_legal;
+            r_dmem_memw  = r_legal;
+             r_dmem_align = 2'b11;
+        end
     
             OPCODE_STORE: begin // Store instructions
                 r_imm_format = 6'b000100; // S-type
@@ -289,10 +346,163 @@ module decoder (
                         r_legal      = 1'b1;
                         r_dmem_memw  = 1'b1;
                         r_dmem_align = 2'b11;
-                    end
-                    default: r_legal = 1'b0;
-                endcase
+
+                        end
+                        default: begin
+                            r_legal = 1'b0;
+                            end 
+                        endcase
+                        r_frs2_en = r_legal;
+
+                        end
+                        
+                         OPCODE_STORE_FP: begin // fsw
+                r_imm_format = 6'b000100; // S-type
+                r_op2_sel    = 1'b1;
+                r_alu_opsel  = 3'b000;
+
+                r_legal      = (funct3 == 3'b010);
+                r_frs2_en    = r_legal;
+                r_dmem_wen   = r_legal;
+                r_dmem_memw  = r_legal;
+                r_dmem_align = 2'b11;
             end
+
+            OPCODE_OP_FP: begin
+            r_legal = 1'b0;
+
+             case (funct7)
+             7'b0000000: begin 
+             r_legal = (funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b0000100: begin 
+            r_legal = (funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+             7'b0001000: begin
+            r_legal = (funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b0001100: begin 
+            r_legal = (funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b0101100: begin
+            r_legal = (rs2 == 5'b00000 && funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b0010000: begin
+            r_legal = (funct3 == 3'b000 || funct3 == 3'b001 || funct3 == 3'b010);
+        end
+
+            7'b0010100: begin
+            r_legal = (funct3 == 3'b000 || funct3 == 3'b001);
+        end
+
+            7'b1010000: begin
+            r_legal = (funct3 == 3'b000 || funct3 == 3'b001 || funct3 == 3'b010);
+        end
+
+            7'b1110000: begin
+            r_legal = (rs2 == 5'b00000 && (funct3 == 3'b001 || funct3 == 3'b000));
+        end 
+
+            7'b1100000: begin 
+            r_legal = ((rs2 == 5'b00000 || rs2 == 5'b00001) && funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b1101000: begin
+            r_legal = ((rs2 == 5'b00000 || rs2 == 5'b00001) && funct3 != 3'b101 && funct3 != 3'b110);
+        end
+
+            7'b1111000: begin
+            r_legal = (rs2 == 5'b00000 && funct3 == 3'b000);
+        end
+        default: begin
+            r_legal = 1'b0;
+            end
+
+    endcase
+    case (funct7)
+    7'b0000000,
+    7'b0000100,
+    7'b0001000,
+    7'b0001100,
+    7'b0101100,
+    7'b0010000,
+    7'b0010100,
+    7'b1010000,
+    7'b1110000,
+    7'b1100000: begin
+    r_frs1_en = r_legal;
+    end
+
+    default: r_frs1_en = 1'b0;
+endcase
+
+case (funct7)
+    7'b0000000,
+    7'b0000100,
+    7'b0001000,
+    7'b0010000,
+    7'b0010100,
+    7'b1010000: begin
+    r_frs2_en = r_legal;
+    end
+
+    default: r_frs2_en = 1'b0;
+endcase
+case (funct7)
+    7'b0000000,
+    7'b0000100,
+    7'b0001000,
+    7'b0001100,
+    7'b0101100,
+    7'b0010000,
+    7'b0010100,
+    7'b1101000,
+    7'b1111000: begin
+        r_frd_en = r_legal;
+    end
+
+    default: r_frd_en = 1'b0;
+endcase
+case (funct7)
+    7'b1110000: begin
+        r_rd_sel = r_legal ? 5'b10000 : 5'b00000;
+        r_rd_wen = r_legal; // FMV.X.W and FCLASS.S
+    end
+
+    7'b1010000: begin
+        r_rd_sel = r_legal ? 5'b10000 : 5'b00000;
+        r_rd_wen = r_legal; // FEQ.S, FLT.S, FLE.S
+    end
+
+    7'b1100000: begin
+        r_rd_sel = r_legal ? 5'b10000 : 5'b00000;
+        r_rd_wen = r_legal; // FCVT.W.S and FCVT.WU.S
+    end
+
+    default: begin
+        r_rd_sel = 5'b00000;
+    end
+endcase
+    r_fpu = r_legal;
+end
+            OPCODE_FMADD,
+            OPCODE_FMSUB,
+            OPCODE_FNMSUB,
+            OPCODE_FNMADD: begin
+            r_legal = (i_inst[26:25] == 2'b00);
+            r_fpu   = r_legal;
+            r_frs1_en = r_legal;
+            r_frs2_en = r_legal;
+            r_frs3_en = r_legal;
+            r_frd_en = r_legal;
+            end
+
+       
     
             OPCODE_BRANCH: begin // Conditional branches
                 r_imm_format      = 6'b001000; // B-type
@@ -313,7 +523,7 @@ module decoder (
                 r_imm_format = 6'b010000; // U-type
                 r_legal      = 1'b1;
                 r_rd_wen     = 1'b1;
-                r_rd_sel     = 4'b0010;   // Immediate directly into rd
+                r_rd_sel     = 5'b0010;   // Immediate directly into rd
             end
     
             OPCODE_AUIPC: begin // Add Upper Immediate to PC
@@ -323,7 +533,7 @@ module decoder (
                 r_op1_sel    = 1'b1;      // PC
                 r_op2_sel    = 1'b1;      // Immediate
                 r_alu_opsel  = 3'b000;    // ADD
-                r_rd_sel     = 4'b0001;   // ALU result
+                r_rd_sel     = 5'b0001;   // ALU result
             end
     
             OPCODE_JAL: begin // Jump and Link
@@ -332,7 +542,7 @@ module decoder (
                 r_rd_wen     = 1'b1;
                 r_jump       = 1'b1;
                 r_pc_sel     = 1'b0;      // Target base is PC
-                r_rd_sel     = 4'b0100;   // Write PC + 4 to rd
+                r_rd_sel     = 5'b0100;   // Write PC + 4 to rd
             end
     
             OPCODE_JALR: begin // Jump and Link Register
@@ -345,7 +555,7 @@ module decoder (
                         r_alu_opsel = 3'b000;  // ADD
                         r_jump      = 1'b1;
                         r_pc_sel    = 1'b1;    // Target base is calculated by ALU
-                        r_rd_sel    = 4'b0100; // Write PC + 4 to rd
+                        r_rd_sel    = 5'b0100; // Write PC + 4 to rd
                     end
                     default: r_legal = 1'b0;
                 endcase
@@ -355,26 +565,47 @@ module decoder (
                 // Per spec: ONLY ebreak (32'h00100073) is legal and drives halt.
                 // ecall (32'h00000073) is tested in the ILLEGAL group!
                 case (i_inst)
-                    32'h00100073: begin // ebreak
-                        r_legal = 1'b1;
-                        r_halt  = 1'b1;
+                    32'h00100073: begin// ebreak
+                    r_legal = 1'b1;
+                    r_halt = 1'b1;
                     end
                     default: begin
-                        r_legal = 1'b0;
-                    end
-                endcase
+
+                        r_legal = ((i_inst[31:20] == 12'h001 ||
+                        i_inst[31:20] == 12'h002 ||
+                        i_inst[31:20] == 12'h003) &&
+                       (funct3 == 3'b001 ||
+                        funct3 == 3'b010 ||
+                        funct3 == 3'b011 ||
+                        funct3 == 3'b101 ||
+                        funct3 == 3'b110 ||
+                        funct3 == 3'b111));
+
+            r_rd_wen  = r_legal;
+            r_rd_sel  = 5'b10000;
+            r_fpu     = r_legal;
+
             end
+
+            endcase
     
-            default: begin
-                r_legal = 1'b0;
+            end
+            default:begin
             end
         endcase
     end
 
     // Output assignments
+    assign o_mext = r_mext;
+    assign o_fpu = r_fpu;
+    assign o_frs1_en = r_frs1_en;
+    assign o_frs2_en = r_frs2_en;
+    assign o_frs3_en = r_frs3_en;
+    assign o_frd_en = r_frd_en;
+    assign o_rs3    = i_inst[31:27];
     assign o_legal = r_legal;
     assign o_halt = r_halt;
-    assign o_rd = (r_legal && r_rd_wen) ? rd : 5'b00000; // If instruction doesn't write to rd or is illegal, set to x0
+    assign o_rd = (r_legal && r_rd_wen && !r_frd_en) ? rd : 5'b00000; // If instruction doesn't write to rd or is illegal, set to x0
     assign o_op1_sel = r_op1_sel;
     assign o_op2_sel = r_op2_sel;
     assign o_alu_opsel = r_alu_opsel;
@@ -406,3 +637,4 @@ module decoder (
 endmodule
 
 `default_nettype wire
+
