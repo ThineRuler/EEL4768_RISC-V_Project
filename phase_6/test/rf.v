@@ -45,14 +45,26 @@ module rf #(
     //
     // Write register enable, address [0, 31] and input data.
     // input  wire        i_rd_wen, remve this signal
+    input  wire        i_rd_wen,
     input  wire [ 4:0] i_rd_waddr,
-    input  wire [31:0] i_rd_wdata
+    input  wire [31:0] i_rd_wdata,
+
+    //Floating point registers
+    input wire [4:0] i_frs1_raddr,
+    input wire [4:0] i_frs2_raddr,
+    input wire [4:0] i_frs3_raddr,
+    input wire [31:0] i_frd_wdata,
+    input wire [4:0]  i_frd_waddr,
+    input wire      i_frd_wen,
+    output wire [31:0] o_frs1_rdata,
+    output wire [31:0] o_frs2_rdata,
+    output wire [31:0] o_frs3_rdata
 );
     // Your implementation goes under here
     // ------------------------------------
 
     reg [31:0] registers [0:31];
-    
+     reg [31:0] fp_registers [0:31];
        always @(posedge i_clk) begin
            if (i_rst) begin
                registers[0]  <= 32'b0;
@@ -87,14 +99,53 @@ module rf #(
                registers[29] <= 32'b0;
                registers[30] <= 32'b0;
                registers[31] <= 32'b0;
-           end else if (i_rd_waddr != 5'd0) begin
+//RESET
+               fp_registers[0]  <= 32'b0;
+               fp_registers[1]  <= 32'b0;
+               fp_registers[2]  <= 32'b0;
+               fp_registers[3]  <= 32'b0;
+               fp_registers[4]  <= 32'b0;
+               fp_registers[5]  <= 32'b0;
+               fp_registers[6]  <= 32'b0;
+               fp_registers[7]  <= 32'b0;
+               fp_registers[8]  <= 32'b0;
+               fp_registers[9]  <= 32'b0;
+               fp_registers[10] <= 32'b0;
+               fp_registers[11] <= 32'b0;
+               fp_registers[12] <= 32'b0;
+               fp_registers[13] <= 32'b0;
+               fp_registers[14] <= 32'b0;
+               fp_registers[15] <= 32'b0;
+               fp_registers[16] <= 32'b0;
+               fp_registers[17] <= 32'b0;
+               fp_registers[18] <= 32'b0;
+               fp_registers[19] <= 32'b0;
+               fp_registers[20] <= 32'b0;
+               fp_registers[21] <= 32'b0;
+               fp_registers[22] <= 32'b0;
+               fp_registers[23] <= 32'b0;
+               fp_registers[24] <= 32'b0;
+               fp_registers[25] <= 32'b0;
+               fp_registers[26] <= 32'b0;
+               fp_registers[27] <= 32'b0;
+               fp_registers[28] <= 32'b0;
+               fp_registers[29] <= 32'b0;
+               fp_registers[30] <= 32'b0;
+               fp_registers[31] <= 32'b0;
+           end else begin 
+           if (i_rd_wen && (i_rd_waddr != 5'd0)) begin
                registers[i_rd_waddr] <= i_rd_wdata;
            end
+           if(i_frd_wen) begin
+           fp_registers[i_frd_waddr] <= i_frd_wdata;
+           end 
+           end 
        end
     
        assign o_rs1_rdata =
            (i_rs1_raddr == 5'd0) ? 32'b0 :
            (BYPASS_EN &&
+           i_rd_wen &&
             (i_rd_waddr == i_rs1_raddr) &&
             (i_rd_waddr != 5'd0)) ? i_rd_wdata :
            registers[i_rs1_raddr];
@@ -102,9 +153,29 @@ module rf #(
        assign o_rs2_rdata =
            (i_rs2_raddr == 5'd0) ? 32'b0 :
            (BYPASS_EN &&
+           i_rd_wen &&
             (i_rd_waddr == i_rs2_raddr) &&
             (i_rd_waddr != 5'd0)) ? i_rd_wdata :
            registers[i_rs2_raddr];
+
+        assign o_frs1_rdata =
+           (BYPASS_EN && i_frd_wen &&
+            (i_frd_waddr == i_frs1_raddr)) ? 
+            i_frd_wdata : fp_registers[i_frs1_raddr];
+    
+        assign o_frs2_rdata =
+           (BYPASS_EN && i_frd_wen &&
+            (i_frd_waddr == i_frs2_raddr)) ? 
+            i_frd_wdata : fp_registers[i_frs2_raddr];
+
+         assign o_frs3_rdata =
+           (BYPASS_EN && i_frd_wen &&
+            (i_frd_waddr == i_frs3_raddr)) ? 
+            i_frd_wdata : fp_registers[i_frs3_raddr];
+    
+    
+
+        
 
 endmodule
 
