@@ -1,3 +1,6 @@
+`ifndef FPU_NORMALIZE_V
+`define FPU_NORMALIZE_V
+
 `default_nettype none
 
 // Move the leading 1 to the MSB. The caller handles an all-zero input.
@@ -29,3 +32,4 @@ module fpu_normalize #(
 endmodule
 
 `default_nettype wire
+`endif

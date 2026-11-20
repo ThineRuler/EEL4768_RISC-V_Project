@@ -1,3 +1,6 @@
+`ifndef FPU_SHIFT_RIGHT_JAM_V
+`define FPU_SHIFT_RIGHT_JAM_V
+
 `default_nettype none
 
 // Right shift with every discarded bit folded into the output LSB.
@@ -28,3 +31,4 @@ module fpu_shift_right_jam #(
 endmodule
 
 `default_nettype wire
+`endif

@@ -1,3 +1,6 @@
+`ifndef FPU_FMA_V
+`define FPU_FMA_V
+
 `default_nettype none
 
 // (a * b) + c, optionally negating the product and/or addend.
@@ -118,3 +121,4 @@ module fpu_fma (
 endmodule
 
 `default_nettype wire
+`endif

@@ -1,3 +1,6 @@
+`ifndef FPU_DIV_SQRT_V
+`define FPU_DIV_SQRT_V
+
 `default_nettype none
 
 module fpu_div_sqrt (
@@ -140,3 +143,4 @@ module fpu_div_sqrt (
 endmodule
 
 `default_nettype wire
+`endif

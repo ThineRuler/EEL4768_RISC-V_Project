@@ -44,8 +44,6 @@ module rf #(
     // file should remain unchanged at the clock edge.
     //
     // Write register enable, address [0, 31] and input data.
-    // input  wire        i_rd_wen, remve this signal
-    input  wire        i_rd_wen,
     input  wire [ 4:0] i_rd_waddr,
     input  wire [31:0] i_rd_wdata,
 
@@ -133,7 +131,7 @@ module rf #(
                fp_registers[30] <= 32'b0;
                fp_registers[31] <= 32'b0;
            end else begin 
-           if (i_rd_wen && (i_rd_waddr != 5'd0)) begin
+           if (i_rd_waddr != 5'd0) begin
                registers[i_rd_waddr] <= i_rd_wdata;
            end
            if(i_frd_wen) begin
@@ -145,7 +143,6 @@ module rf #(
        assign o_rs1_rdata =
            (i_rs1_raddr == 5'd0) ? 32'b0 :
            (BYPASS_EN &&
-           i_rd_wen &&
             (i_rd_waddr == i_rs1_raddr) &&
             (i_rd_waddr != 5'd0)) ? i_rd_wdata :
            registers[i_rs1_raddr];
@@ -153,7 +150,6 @@ module rf #(
        assign o_rs2_rdata =
            (i_rs2_raddr == 5'd0) ? 32'b0 :
            (BYPASS_EN &&
-           i_rd_wen &&
             (i_rd_waddr == i_rs2_raddr) &&
             (i_rd_waddr != 5'd0)) ? i_rd_wdata :
            registers[i_rs2_raddr];

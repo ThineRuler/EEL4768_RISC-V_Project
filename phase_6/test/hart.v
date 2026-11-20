@@ -106,7 +106,26 @@ module hart #(
     // the next program counter after the instruction is retired. For most
     // instructions, this is `o_retire_pc + 4`, but must be the branch or jump
     // target for *taken* branches and jumps.
-    output wire [31:0] o_retire_next_pc
+    output wire [31:0] o_retire_next_pc,
+    // F extension retire fields. The floating-point source registers read
+    // by the instruction being retired (addresses are the instruction's rs1,
+    // rs2 and rs3 fields) and their values as read in the decode stage; they
+    // are only meaningful for instructions that read them.
+    output wire [ 4:0] o_retire_frs1_raddr,
+    output wire [31:0] o_retire_frs1_rdata,
+    output wire [ 4:0] o_retire_frs2_raddr,
+    output wire [31:0] o_retire_frs2_rdata,
+    output wire [ 4:0] o_retire_frs3_raddr,
+    output wire [31:0] o_retire_frs3_rdata,
+    // Asserted when the instruction being retired writes floating-point
+    // register `o_retire_frd_waddr` with `o_retire_frd_wdata`. (f0 is an
+    // ordinary register, so an enable is needed.)
+    output wire        o_retire_frd_wen,
+    output wire [ 4:0] o_retire_frd_waddr,
+    output wire [31:0] o_retire_frd_wdata,
+    // The accrued floating-point exception flags (fflags) after the
+    // instruction being retired.
+    output wire [ 4:0] o_retire_fflags
 
 `ifdef RISCV_FORMAL
     ,`RVFI_OUTPUTS,
@@ -173,12 +192,22 @@ module hart #(
     wire        r_dmem_memh;
     wire        r_dmem_memw;
     wire        r_dmem_memu;
-    wire [3:0]  r_rd_sel;
+    wire [4:0]  r_rd_sel;
     wire        r_pc_sel;
     wire [31:0] r_immediate;
     wire [4:0]  r_rs1;
     wire [4:0]  r_rs2;
     wire [4:0]  r_rd;
+    wire        r_mext;
+    wire        r_fpu;
+    wire        r_frs1_en;
+    wire        r_frs2_en;
+    wire        r_frs3_en;
+    wire [4:0]  r_rs3;
+    wire        r_frd_en;
+    wire [31:0] frs1_data;
+    wire [31:0] frs2_data;
+    wire [31:0] frs3_data;
     wire [31:0] rs1_data;
     wire [31:0] rs2_data;
     wire [6:0]  inst_opcode;
@@ -223,13 +252,23 @@ module hart #(
     reg         ID_EX_dmem_memw;
     reg         ID_EX_dmem_memu;
 
-    reg  [3:0]  ID_EX_rd_sel;
+    reg  [4:0]  ID_EX_rd_sel;
     reg         ID_EX_pc_sel;
     reg         ID_EX_legal;
     reg         ID_EX_halt;
     reg         ID_EX_rs1_is_read;
     reg         ID_EX_rs2_is_read;
     reg         ID_EX_trap;
+    reg         ID_EX_mext;
+    reg         ID_EX_fpu;
+    reg         ID_EX_frs1_en;
+    reg         ID_EX_frs2_en;
+    reg         ID_EX_frs3_en;
+    reg  [4:0]  ID_EX_rs3;
+    reg         ID_EX_frd_en;
+    reg  [31:0] ID_EX_frs1_data;
+    reg  [31:0] ID_EX_frs2_data;
+    reg  [31:0] ID_EX_frs3_data;
 
     // ------------------------------------------------------------------------
     // EX Stage Signals
@@ -241,6 +280,9 @@ module hart #(
     wire [31:0] r_alu_op2;
     wire [31:0] r_forward_rs1;
     wire [31:0] r_forward_rs2;
+    wire [31:0] r_forward_frs1;
+    wire [31:0] r_forward_frs2;
+    wire [31:0] r_forward_frs3;
     wire [31:0] r_exmem_fwd_data;
     wire [31:0] branch_target;
     wire [31:0] jump_target;
@@ -248,6 +290,14 @@ module hart #(
     wire        branch_taken;
     wire        is_jump;
     wire [31:0] EX_next_pc;
+    wire        alu_busy;
+    wire        fpu_busy;
+    wire        fpu_rm_trap;
+    wire [31:0] fpu_fp_result;
+    wire [31:0] fpu_int_result;
+    wire [4:0]  fpu_fflags;
+    wire [31:0] r_ex_result;
+    wire        ex_stall;
 
     // ------------------------------------------------------------------------
     // EX/MEM Pipeline Register
@@ -271,7 +321,7 @@ module hart #(
     reg         EX_MEM_dmem_memw;
     reg         EX_MEM_dmem_memu;
 
-    reg  [3:0]  EX_MEM_rd_sel;
+    reg  [4:0]  EX_MEM_rd_sel;
     reg         EX_MEM_pc_sel;
     reg         EX_MEM_legal;
     reg         EX_MEM_halt;
@@ -281,6 +331,17 @@ module hart #(
     reg         EX_MEM_rs1_is_read;
     reg         EX_MEM_rs2_is_read;
     reg         EX_MEM_trap;
+    reg         EX_MEM_fpu;
+    reg         EX_MEM_frs1_en;
+    reg         EX_MEM_frs2_en;
+    reg         EX_MEM_frs3_en;
+    reg  [4:0]  EX_MEM_rs3;
+    reg         EX_MEM_frd_en;
+    reg  [31:0] EX_MEM_frs1_data;
+    reg  [31:0] EX_MEM_frs2_data;
+    reg  [31:0] EX_MEM_frs3_data;
+    reg  [31:0] EX_MEM_fp_result;
+    reg  [4:0]  EX_MEM_fflags;
 
     // ------------------------------------------------------------------------
     // MEM Stage Signals
@@ -289,6 +350,8 @@ module hart #(
     wire        misaligned_access;
     wire        trap_in_mem;
     wire [31:0] r_store_data;
+    wire [31:0] r_fstore_data;
+    wire [31:0] effective_store_data;
     wire [ 7:0] raw_byte;
     wire [15:0] raw_half;
     wire [31:0] mem_rdata_ext;
@@ -306,7 +369,7 @@ module hart #(
     reg  [31:0] MEM_WB_mem_rdata;
     reg  [4:0]  MEM_WB_rd;
     reg  [31:0] MEM_WB_immediate;
-    reg  [3:0]  MEM_WB_rd_sel;
+    reg  [4:0]  MEM_WB_rd_sel;
 
     reg         MEM_WB_trap;
     reg         MEM_WB_legal;
@@ -318,6 +381,16 @@ module hart #(
     reg  [31:0] MEM_WB_rs2_data;
     reg         MEM_WB_rs1_is_read;
     reg         MEM_WB_rs2_is_read;
+    reg         MEM_WB_frs1_en;
+    reg         MEM_WB_frs2_en;
+    reg         MEM_WB_frs3_en;
+    reg  [4:0]  MEM_WB_rs3;
+    reg         MEM_WB_frd_en;
+    reg  [31:0] MEM_WB_frs1_data;
+    reg  [31:0] MEM_WB_frs2_data;
+    reg  [31:0] MEM_WB_frs3_data;
+    reg  [31:0] MEM_WB_fp_result;
+    reg  [4:0]  MEM_WB_fflags;
 
     reg  [31:0] MEM_WB_dmem_addr;
     reg         MEM_WB_dmem_ren;
@@ -332,6 +405,9 @@ module hart #(
     wire [31:0] rd_data;
     wire [31:0] r_memwb_fwd_data;
     wire [4:0]  actual_rd_waddr;
+    wire        actual_frd_wen;
+    wire [4:0]  actual_frd_waddr;
+    wire [31:0] actual_frd_wdata;
 
     // ========================================================================
     // 1. Program Counter (PC) & IF Stage
@@ -433,9 +509,16 @@ module hart #(
         .o_op1_sel          (r_op1_sel),
         .o_op2_sel          (r_op2_sel),
         .o_alu_opsel        (r_alu_opsel),
+        .o_mext             (r_mext),
+        .o_fpu              (r_fpu),
         .o_alu_sub          (r_alu_sub),
         .o_alu_unsigned     (r_alu_unsigned),
         .o_alu_arith        (r_alu_arith),
+        .o_frs1_en          (r_frs1_en),
+        .o_frs2_en          (r_frs2_en),
+        .o_frs3_en          (r_frs3_en),
+        .o_rs3              (r_rs3),
+        .o_frd_en           (r_frd_en),
         .o_branch           (r_branch),
         .o_jump             (r_jump),
         .o_branch_equal     (r_branch_equal),
@@ -458,6 +541,9 @@ module hart #(
 
     // Writes to x0 or when trapped are discarded by gating actual_rd_waddr to 5'd0.
     assign actual_rd_waddr = (!MEM_WB_valid || MEM_WB_trap) ? 5'd0 : MEM_WB_rd;
+    assign actual_frd_wen   = MEM_WB_valid && MEM_WB_frd_en && !MEM_WB_trap;
+    assign actual_frd_waddr = MEM_WB_rd;
+    assign actual_frd_wdata = (MEM_WB_rd_sel[3]) ? MEM_WB_mem_rdata : MEM_WB_fp_result;
 
     rf #(
         .BYPASS_EN(BYPASS_EN)
@@ -469,7 +555,16 @@ module hart #(
         .i_rs1_raddr    (r_rs1),
         .i_rs2_raddr    (r_rs2),
         .i_rd_waddr     (actual_rd_waddr),
-        .i_rd_wdata     (rd_data)
+        .i_rd_wdata     (rd_data),
+        .i_frs1_raddr   (r_rs1),
+        .o_frs1_rdata   (frs1_data),
+        .i_frs2_raddr   (r_rs2),
+        .o_frs2_rdata   (frs2_data),
+        .i_frs3_raddr   (r_rs3),
+        .o_frs3_rdata   (frs3_data),
+        .i_frd_wen      (actual_frd_wen),
+        .i_frd_waddr    (actual_frd_waddr),
+        .i_frd_wdata    (actual_frd_wdata)
     );
 
     // Drives cycle-by-cycle retire information for the testbench.
@@ -482,7 +577,10 @@ module hart #(
         (inst_opcode == 7'b0000011) | // LOAD
         (inst_opcode == 7'b0100011) | // STORE
         (inst_opcode == 7'b1100011) | // BRANCH
-        (inst_opcode == 7'b1100111)   // JALR
+        (inst_opcode == 7'b1100111) | // JALR
+        (inst_opcode == 7'b0000111) | // LOAD_FP (flw)
+        (inst_opcode == 7'b0100111) | // STORE_FP (fsw)
+        (r_fpu && !r_frs1_en)        // FPU reading integer rs1
     );
 
     // rs2 is read only by OP, STORE, and BRANCH
@@ -502,25 +600,33 @@ module hart #(
     // Load-use hazard: checks if the instruction in ID depends on the load in EX
     wire load_use_hazard;
     assign load_use_hazard =
-        ID_EX_valid && ID_EX_dmem_ren && (ID_EX_rd != 5'd0) &&
+        (ID_EX_valid && ID_EX_dmem_ren) &&
         (
-            (rs1_is_read && (r_rs1 == ID_EX_rd)) ||
-            (rs2_is_read && (r_rs2 == ID_EX_rd))
+            (!ID_EX_frd_en && (ID_EX_rd != 5'd0) && (
+                (rs1_is_read && (r_rs1 == ID_EX_rd)) ||
+                (rs2_is_read && (r_rs2 == ID_EX_rd))
+            )) ||
+            (ID_EX_frd_en && (
+                (r_frs1_en && (r_rs1 == ID_EX_rd)) ||
+                (r_frs2_en && (r_rs2 == ID_EX_rd)) ||
+                (r_frs3_en && (r_rs3 == ID_EX_rd))
+            ))
         );
 
     // When forwarding is disabled (FWD_EN == 0), stall on any RAW dependency in EX, MEM, or WB
     wire raw_stall_no_fwd;
     assign raw_stall_no_fwd =
         (!FWD_EN) && (
-            (ID_EX_valid && (ID_EX_rd != 5'd0) && (ID_EX_rd_sel != 4'd0) &&
+            (ID_EX_valid && (ID_EX_rd != 5'd0) && (ID_EX_rd_sel != 5'd0) &&
                 ((rs1_is_read && (r_rs1 == ID_EX_rd)) || (rs2_is_read && (r_rs2 == ID_EX_rd)))) ||
-            (EX_MEM_valid && (EX_MEM_rd != 5'd0) && (EX_MEM_rd_sel != 4'd0) &&
+            (EX_MEM_valid && (EX_MEM_rd != 5'd0) && (EX_MEM_rd_sel != 5'd0) &&
                 ((rs1_is_read && (r_rs1 == EX_MEM_rd)) || (rs2_is_read && (r_rs2 == EX_MEM_rd)))) ||
-            (MEM_WB_valid && (MEM_WB_rd != 5'd0) && (MEM_WB_rd_sel != 4'd0) &&
+            (MEM_WB_valid && (MEM_WB_rd != 5'd0) && (MEM_WB_rd_sel != 5'd0) &&
                 ((rs1_is_read && (r_rs1 == MEM_WB_rd)) || (rs2_is_read && (r_rs2 == MEM_WB_rd))))
         );
 
-    assign stall = load_use_hazard || raw_stall_no_fwd;
+    assign ex_stall = alu_busy || fpu_busy || dcache_stall;
+    assign stall = load_use_hazard || raw_stall_no_fwd || ex_stall;
 
     // ========================================================================
     // ID/EX Pipeline Registers
@@ -563,14 +669,24 @@ module hart #(
             ID_EX_dmem_memw       <= 1'b0;
             ID_EX_dmem_memu       <= 1'b0;
 
-            ID_EX_rd_sel          <= 4'd0;
+            ID_EX_rd_sel          <= 5'd0;
             ID_EX_pc_sel          <= 1'b0;
             ID_EX_legal           <= 1'b0;
             ID_EX_halt            <= 1'b0;
             ID_EX_rs1_is_read     <= 1'b0;
             ID_EX_rs2_is_read     <= 1'b0;
             ID_EX_trap            <= 1'b0;
-        end else if (dcache_stall) begin
+            ID_EX_mext            <= 1'b0;
+            ID_EX_fpu             <= 1'b0;
+            ID_EX_frs1_en         <= 1'b0;
+            ID_EX_frs2_en         <= 1'b0;
+            ID_EX_frs3_en         <= 1'b0;
+            ID_EX_rs3             <= 5'd0;
+            ID_EX_frd_en          <= 1'b0;
+            ID_EX_frs1_data       <= 32'd0;
+            ID_EX_frs2_data       <= 32'd0;
+            ID_EX_frs3_data       <= 32'd0;
+        end else if (dcache_stall || alu_busy || fpu_busy) begin
             ID_EX_PC              <= ID_EX_PC;
             ID_EX_next_pc         <= ID_EX_next_pc;
             ID_EX_link_pc         <= ID_EX_link_pc;
@@ -613,6 +729,16 @@ module hart #(
             ID_EX_rs1_is_read     <= ID_EX_rs1_is_read;
             ID_EX_rs2_is_read     <= ID_EX_rs2_is_read;
             ID_EX_trap            <= ID_EX_trap;
+            ID_EX_mext            <= ID_EX_mext;
+            ID_EX_fpu             <= ID_EX_fpu;
+            ID_EX_frs1_en         <= ID_EX_frs1_en;
+            ID_EX_frs2_en         <= ID_EX_frs2_en;
+            ID_EX_frs3_en         <= ID_EX_frs3_en;
+            ID_EX_rs3             <= ID_EX_rs3;
+            ID_EX_frd_en          <= ID_EX_frd_en;
+            ID_EX_frs1_data       <= r_forward_frs1;
+            ID_EX_frs2_data       <= r_forward_frs2;
+            ID_EX_frs3_data       <= r_forward_frs3;
         end else if (flush || stall) begin
             // Insert bubble into EX on branch/jump flush or load-use stall
             ID_EX_PC              <= 32'd0;
@@ -650,13 +776,23 @@ module hart #(
             ID_EX_dmem_memw       <= 1'b0;
             ID_EX_dmem_memu       <= 1'b0;
 
-            ID_EX_rd_sel          <= 4'd0;
+            ID_EX_rd_sel          <= 5'd0;
             ID_EX_pc_sel          <= 1'b0;
             ID_EX_legal           <= 1'b0;
             ID_EX_halt            <= 1'b0;
             ID_EX_rs1_is_read     <= 1'b0;
             ID_EX_rs2_is_read     <= 1'b0;
             ID_EX_trap            <= 1'b0;
+            ID_EX_mext            <= 1'b0;
+            ID_EX_fpu             <= 1'b0;
+            ID_EX_frs1_en         <= 1'b0;
+            ID_EX_frs2_en         <= 1'b0;
+            ID_EX_frs3_en         <= 1'b0;
+            ID_EX_rs3             <= 5'd0;
+            ID_EX_frd_en          <= 1'b0;
+            ID_EX_frs1_data       <= 32'd0;
+            ID_EX_frs2_data       <= 32'd0;
+            ID_EX_frs3_data       <= 32'd0;
         end else begin
             // Normal latching of the Decoder & RF outputs
             ID_EX_PC              <= IF_ID_PC;
@@ -701,6 +837,16 @@ module hart #(
             ID_EX_rs1_is_read     <= rs1_is_read;
             ID_EX_rs2_is_read     <= rs2_is_read;
             ID_EX_trap            <= ID_trap;
+            ID_EX_mext            <= r_mext;
+            ID_EX_fpu             <= r_fpu;
+            ID_EX_frs1_en         <= r_frs1_en;
+            ID_EX_frs2_en         <= r_frs2_en;
+            ID_EX_frs3_en         <= r_frs3_en;
+            ID_EX_rs3             <= r_rs3;
+            ID_EX_frd_en          <= r_frd_en;
+            ID_EX_frs1_data       <= frs1_data;
+            ID_EX_frs2_data       <= frs2_data;
+            ID_EX_frs3_data       <= frs3_data;
         end
     end
 
@@ -715,6 +861,7 @@ module hart #(
         EX_MEM_rd_sel[0] ? EX_MEM_result :
         EX_MEM_rd_sel[1] ? EX_MEM_immediate :
         EX_MEM_rd_sel[2] ? EX_MEM_link_pc :
+        EX_MEM_rd_sel[4] ? EX_MEM_result :
                            32'd0;
 
     // Forwarding to ALU operand 1 (rs1)
@@ -726,7 +873,7 @@ module hart #(
          EX_MEM_legal &&
          (!EX_MEM_halt) &&
          (EX_MEM_rd != 5'd0) &&
-         (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2]) &&
+         (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2] || EX_MEM_rd_sel[4]) &&
          (EX_MEM_rd == ID_EX_rs1))
         ? r_exmem_fwd_data :
 
@@ -736,7 +883,7 @@ module hart #(
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
          (MEM_WB_rd != 5'd0) &&
-         (MEM_WB_rd_sel != 4'd0) &&
+         (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == ID_EX_rs1))
         ? r_memwb_fwd_data :
 
@@ -750,7 +897,7 @@ module hart #(
          EX_MEM_legal &&
          (!EX_MEM_halt) &&
          (EX_MEM_rd != 5'd0) &&
-         (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2]) &&
+         (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2] || EX_MEM_rd_sel[4]) &&
          (EX_MEM_rd == ID_EX_rs2))
         ? r_exmem_fwd_data :
 
@@ -760,27 +907,106 @@ module hart #(
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
          (MEM_WB_rd != 5'd0) &&
-         (MEM_WB_rd_sel != 4'd0) &&
+         (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == ID_EX_rs2))
         ? r_memwb_fwd_data :
 
         ID_EX_rs2_data;
+
+    // Floating-point operand forwarding
+    assign r_forward_frs1 =
+        (FWD_EN &&
+         EX_MEM_valid &&
+         (!EX_MEM_halt) &&
+         EX_MEM_frd_en &&
+         (EX_MEM_rd == ID_EX_rs1))
+        ? EX_MEM_fp_result :
+
+        (FWD_EN &&
+         MEM_WB_valid &&
+         (!MEM_WB_trap) &&
+         (!MEM_WB_halt) &&
+         MEM_WB_frd_en &&
+         (MEM_WB_rd == ID_EX_rs1))
+        ? actual_frd_wdata :
+
+        ID_EX_frs1_data;
+
+    assign r_forward_frs2 =
+        (FWD_EN &&
+         EX_MEM_valid &&
+         (!EX_MEM_halt) &&
+         EX_MEM_frd_en &&
+         (EX_MEM_rd == ID_EX_rs2))
+        ? EX_MEM_fp_result :
+
+        (FWD_EN &&
+         MEM_WB_valid &&
+         (!MEM_WB_trap) &&
+         (!MEM_WB_halt) &&
+         MEM_WB_frd_en &&
+         (MEM_WB_rd == ID_EX_rs2))
+        ? actual_frd_wdata :
+
+        ID_EX_frs2_data;
+
+    assign r_forward_frs3 =
+        (FWD_EN &&
+         EX_MEM_valid &&
+         (!EX_MEM_halt) &&
+         EX_MEM_frd_en &&
+         (EX_MEM_rd == ID_EX_rs3))
+        ? EX_MEM_fp_result :
+
+        (FWD_EN &&
+         MEM_WB_valid &&
+         (!MEM_WB_trap) &&
+         (!MEM_WB_halt) &&
+         MEM_WB_frd_en &&
+         (MEM_WB_rd == ID_EX_rs3))
+        ? actual_frd_wdata :
+
+        ID_EX_frs3_data;
 
     // ALU operands
     assign r_alu_op1 = ID_EX_op1_sel ? ID_EX_PC : r_forward_rs1;
     assign r_alu_op2 = ID_EX_op2_sel ? ID_EX_immediate : r_forward_rs2;
 
     alu alu_i (
+        .i_clk      (i_clk),
+        .i_rst      (i_rst),
         .i_opsel    (ID_EX_alu_opsel),
         .i_sub      (ID_EX_alu_sub),
         .i_unsigned (ID_EX_alu_unsigned),
-        .o_slt      (r_alu_slt),
-        .o_eq       (r_alu_eq),
-        .o_result   (r_result),
+        .i_arith    (ID_EX_alu_arith),
+        .i_mext     (ID_EX_mext),
+        .i_advance  (!ex_stall),
         .i_op1      (r_alu_op1),
         .i_op2      (r_alu_op2),
-        .i_arith    (ID_EX_alu_arith)
+        .o_result   (r_result),
+        .o_eq       (r_alu_eq),
+        .o_slt      (r_alu_slt),
+        .o_busy     (alu_busy)
     );
+
+    fpu fpu_i (
+        .i_clk        (i_clk),
+        .i_rst        (i_rst),
+        .i_inst       (ID_EX_instruct),
+        .i_valid      (ID_EX_valid && ID_EX_fpu),
+        .i_advance    (!ex_stall),
+        .i_frs1       (r_forward_frs1),
+        .i_frs2       (r_forward_frs2),
+        .i_frs3       (r_forward_frs3),
+        .i_xrs1       (r_forward_rs1),
+        .o_fp_result  (fpu_fp_result),
+        .o_int_result (fpu_int_result),
+        .o_fflags     (fpu_fflags),
+        .o_busy       (fpu_busy),
+        .o_rm_trap    (fpu_rm_trap)
+    );
+
+    assign r_ex_result = ID_EX_rd_sel[4] ? fpu_int_result : r_result;
 
     // ========================================================================
     // Branch and Jump Logic (Section 4.1.3 & 4.2.2)
@@ -825,7 +1051,7 @@ module hart #(
             EX_MEM_dmem_memw   <= 1'b0;
             EX_MEM_dmem_memu   <= 1'b0;
 
-            EX_MEM_rd_sel      <= 4'd0;
+            EX_MEM_rd_sel      <= 5'd0;
             EX_MEM_pc_sel      <= 1'b0;
             EX_MEM_legal       <= 1'b0;
             EX_MEM_halt        <= 1'b0;
@@ -835,6 +1061,17 @@ module hart #(
             EX_MEM_rs1_is_read <= 1'b0;
             EX_MEM_rs2_is_read <= 1'b0;
             EX_MEM_trap        <= 1'b0;
+            EX_MEM_fpu         <= 1'b0;
+            EX_MEM_frs1_en     <= 1'b0;
+            EX_MEM_frs2_en     <= 1'b0;
+            EX_MEM_frs3_en     <= 1'b0;
+            EX_MEM_rs3         <= 5'd0;
+            EX_MEM_frd_en      <= 1'b0;
+            EX_MEM_frs1_data   <= 32'd0;
+            EX_MEM_frs2_data   <= 32'd0;
+            EX_MEM_frs3_data   <= 32'd0;
+            EX_MEM_fp_result   <= 32'd0;
+            EX_MEM_fflags      <= 5'd0;
         end else if (dcache_stall) begin
             // Hold all EX/MEM values during D-cache stall (Section 4.7)
             EX_MEM_PC          <= EX_MEM_PC;
@@ -844,7 +1081,7 @@ module hart #(
             EX_MEM_valid       <= EX_MEM_valid;
 
             EX_MEM_result      <= EX_MEM_result;
-            EX_MEM_rs2_data    <= r_store_data;
+            EX_MEM_rs2_data    <= effective_store_data;
             EX_MEM_rd          <= EX_MEM_rd;
             EX_MEM_immediate   <= EX_MEM_immediate;
 
@@ -866,6 +1103,59 @@ module hart #(
             EX_MEM_rs1_is_read <= EX_MEM_rs1_is_read;
             EX_MEM_rs2_is_read <= EX_MEM_rs2_is_read;
             EX_MEM_trap        <= EX_MEM_trap;
+            EX_MEM_fpu         <= EX_MEM_fpu;
+            EX_MEM_frs1_en     <= EX_MEM_frs1_en;
+            EX_MEM_frs2_en     <= EX_MEM_frs2_en;
+            EX_MEM_frs3_en     <= EX_MEM_frs3_en;
+            EX_MEM_rs3         <= EX_MEM_rs3;
+            EX_MEM_frd_en      <= EX_MEM_frd_en;
+            EX_MEM_frs1_data   <= EX_MEM_frs1_data;
+            EX_MEM_frs2_data   <= EX_MEM_frs2_data;
+            EX_MEM_frs3_data   <= EX_MEM_frs3_data;
+            EX_MEM_fp_result   <= EX_MEM_fp_result;
+            EX_MEM_fflags      <= EX_MEM_fflags;
+        end else if (alu_busy || fpu_busy) begin
+            // Hold / inject bubble into EX_MEM while functional unit is busy
+            EX_MEM_PC          <= 32'd0;
+            EX_MEM_next_pc     <= 32'd0;
+            EX_MEM_link_pc     <= 32'd0;
+            EX_MEM_instruct    <= 32'h00000013;
+            EX_MEM_valid       <= 1'b0;
+
+            EX_MEM_result      <= 32'd0;
+            EX_MEM_rs2_data    <= 32'd0;
+            EX_MEM_rd          <= 5'd0;
+            EX_MEM_immediate   <= 32'd0;
+
+            EX_MEM_dmem_ren    <= 1'b0;
+            EX_MEM_dmem_wen    <= 1'b0;
+            EX_MEM_dmem_align  <= 2'd0;
+            EX_MEM_dmem_memb   <= 1'b0;
+            EX_MEM_dmem_memh   <= 1'b0;
+            EX_MEM_dmem_memw   <= 1'b0;
+            EX_MEM_dmem_memu   <= 1'b0;
+
+            EX_MEM_rd_sel      <= 5'd0;
+            EX_MEM_pc_sel      <= 1'b0;
+            EX_MEM_legal       <= 1'b0;
+            EX_MEM_halt        <= 1'b0;
+            EX_MEM_rs1         <= 5'd0;
+            EX_MEM_rs2         <= 5'd0;
+            EX_MEM_rs1_data    <= 32'd0;
+            EX_MEM_rs1_is_read <= 1'b0;
+            EX_MEM_rs2_is_read <= 1'b0;
+            EX_MEM_trap        <= 1'b0;
+            EX_MEM_fpu         <= 1'b0;
+            EX_MEM_frs1_en     <= 1'b0;
+            EX_MEM_frs2_en     <= 1'b0;
+            EX_MEM_frs3_en     <= 1'b0;
+            EX_MEM_rs3         <= 5'd0;
+            EX_MEM_frd_en      <= 1'b0;
+            EX_MEM_frs1_data   <= 32'd0;
+            EX_MEM_frs2_data   <= 32'd0;
+            EX_MEM_frs3_data   <= 32'd0;
+            EX_MEM_fp_result   <= 32'd0;
+            EX_MEM_fflags      <= 5'd0;
         end else begin
             EX_MEM_PC          <= ID_EX_PC;
             EX_MEM_next_pc     <= EX_next_pc;
@@ -873,7 +1163,7 @@ module hart #(
             EX_MEM_instruct    <= ID_EX_instruct;
             EX_MEM_valid       <= ID_EX_valid;
 
-            EX_MEM_result      <= r_result;
+            EX_MEM_result      <= r_ex_result;
             EX_MEM_rs2_data    <= r_forward_rs2;
             EX_MEM_rd          <= ID_EX_rd;
             EX_MEM_immediate   <= ID_EX_immediate;
@@ -895,7 +1185,18 @@ module hart #(
             EX_MEM_rs1_data    <= r_forward_rs1;
             EX_MEM_rs1_is_read <= ID_EX_rs1_is_read;
             EX_MEM_rs2_is_read <= ID_EX_rs2_is_read;
-            EX_MEM_trap        <= ID_EX_trap;
+            EX_MEM_trap        <= ID_EX_trap | (ID_EX_valid && ID_EX_fpu && fpu_rm_trap);
+            EX_MEM_fpu         <= ID_EX_fpu;
+            EX_MEM_frs1_en     <= ID_EX_frs1_en;
+            EX_MEM_frs2_en     <= ID_EX_frs2_en;
+            EX_MEM_frs3_en     <= ID_EX_frs3_en;
+            EX_MEM_rs3         <= ID_EX_rs3;
+            EX_MEM_frd_en      <= ID_EX_frd_en;
+            EX_MEM_frs1_data   <= r_forward_frs1;
+            EX_MEM_frs2_data   <= r_forward_frs2;
+            EX_MEM_frs3_data   <= r_forward_frs3;
+            EX_MEM_fp_result   <= fpu_fp_result;
+            EX_MEM_fflags      <= fpu_fflags;
         end
     end
 
@@ -911,10 +1212,22 @@ module hart #(
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
          (MEM_WB_rd != 5'd0) &&
-         (MEM_WB_rd_sel != 4'd0) &&
+         (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == EX_MEM_rs2))
         ? r_memwb_fwd_data :
         EX_MEM_rs2_data;
+
+    assign r_fstore_data =
+        (FWD_EN &&
+         MEM_WB_valid &&
+         (!MEM_WB_trap) &&
+         (!MEM_WB_halt) &&
+         MEM_WB_frd_en &&
+         (MEM_WB_rd == EX_MEM_rs2))
+        ? actual_frd_wdata :
+        EX_MEM_frs2_data;
+
+    assign effective_store_data = EX_MEM_frs2_en ? r_fstore_data : r_store_data;
 
     assign mem_byte_offset = EX_MEM_result[1:0];
 
@@ -945,14 +1258,14 @@ module hart #(
                           ) : 4'b0000;
 
     // Store data positioning into active byte lanes
-    assign dcache_wdata = EX_MEM_dmem_memw ? r_store_data :
-                          EX_MEM_dmem_memh ? (mem_byte_offset[1] ? {r_store_data[15:0], 16'b0} : {16'b0, r_store_data[15:0]}) :
+    assign dcache_wdata = EX_MEM_dmem_memw ? effective_store_data :
+                          EX_MEM_dmem_memh ? (mem_byte_offset[1] ? {effective_store_data[15:0], 16'b0} : {16'b0, effective_store_data[15:0]}) :
                           EX_MEM_dmem_memb ? (
-                              (mem_byte_offset == 2'b00) ? {24'b0, r_store_data[7:0]} :
-                              (mem_byte_offset == 2'b01) ? {16'b0, r_store_data[7:0], 8'b0} :
-                              (mem_byte_offset == 2'b10) ? {8'b0, r_store_data[7:0], 16'b0} :
-                                                           {r_store_data[7:0], 24'b0}
-                          ) : r_store_data;
+                              (mem_byte_offset == 2'b00) ? {24'b0, effective_store_data[7:0]} :
+                              (mem_byte_offset == 2'b01) ? {16'b0, effective_store_data[7:0], 8'b0} :
+                              (mem_byte_offset == 2'b10) ? {8'b0, effective_store_data[7:0], 16'b0} :
+                                                           {effective_store_data[7:0], 24'b0}
+                          ) : effective_store_data;
 
     cache #(
         .EVICT_POLICY (EVICT_POLICY),
@@ -1012,7 +1325,7 @@ module hart #(
             MEM_WB_mem_rdata   <= 32'd0;
             MEM_WB_rd          <= 5'd0;
             MEM_WB_immediate   <= 32'd0;
-            MEM_WB_rd_sel      <= 4'd0;
+            MEM_WB_rd_sel      <= 5'd0;
 
             MEM_WB_trap        <= 1'b0;
             MEM_WB_legal       <= 1'b0;
@@ -1024,6 +1337,16 @@ module hart #(
             MEM_WB_rs2_data    <= 32'd0;
             MEM_WB_rs1_is_read <= 1'b0;
             MEM_WB_rs2_is_read <= 1'b0;
+            MEM_WB_frs1_en     <= 1'b0;
+            MEM_WB_frs2_en     <= 1'b0;
+            MEM_WB_frs3_en     <= 1'b0;
+            MEM_WB_rs3         <= 5'd0;
+            MEM_WB_frd_en      <= 1'b0;
+            MEM_WB_frs1_data   <= 32'd0;
+            MEM_WB_frs2_data   <= 32'd0;
+            MEM_WB_frs3_data   <= 32'd0;
+            MEM_WB_fp_result   <= 32'd0;
+            MEM_WB_fflags      <= 5'd0;
 
             MEM_WB_dmem_addr   <= 32'd0;
             MEM_WB_dmem_ren    <= 1'b0;
@@ -1057,9 +1380,19 @@ module hart #(
             MEM_WB_rs1         <= EX_MEM_rs1;
             MEM_WB_rs2         <= EX_MEM_rs2;
             MEM_WB_rs1_data    <= EX_MEM_rs1_data;
-            MEM_WB_rs2_data    <= r_store_data; // Reflects MEM->MEM forwarding!
+            MEM_WB_rs2_data    <= effective_store_data; // Reflects MEM->MEM forwarding!
             MEM_WB_rs1_is_read <= EX_MEM_rs1_is_read;
             MEM_WB_rs2_is_read <= EX_MEM_rs2_is_read;
+            MEM_WB_frs1_en     <= EX_MEM_frs1_en;
+            MEM_WB_frs2_en     <= EX_MEM_frs2_en;
+            MEM_WB_frs3_en     <= EX_MEM_frs3_en;
+            MEM_WB_rs3         <= EX_MEM_rs3;
+            MEM_WB_frd_en      <= EX_MEM_frd_en;
+            MEM_WB_frs1_data   <= EX_MEM_frs1_data;
+            MEM_WB_frs2_data   <= EX_MEM_frs2_data;
+            MEM_WB_frs3_data   <= EX_MEM_frs3_data;
+            MEM_WB_fp_result   <= EX_MEM_fp_result;
+            MEM_WB_fflags      <= EX_MEM_fflags;
 
             // Latch memory operation control signals for retirement
             MEM_WB_dmem_addr   <= {EX_MEM_result[31:2], 2'b00};
@@ -1080,11 +1413,13 @@ module hart #(
     // [1] = immediate (LUI)
     // [2] = PC + 4 (JAL / JALR link address)
     // [3] = memory load data
+    // [4] = FPU integer result
     assign rd_data =
         MEM_WB_rd_sel[0] ? MEM_WB_result :
         MEM_WB_rd_sel[1] ? MEM_WB_immediate :
         MEM_WB_rd_sel[2] ? MEM_WB_link_pc :
         MEM_WB_rd_sel[3] ? MEM_WB_mem_rdata :
+        MEM_WB_rd_sel[4] ? MEM_WB_result :
                            32'd0;
 
     // MEM/WB forwarding uses the same final value that is written back.
@@ -1121,6 +1456,22 @@ module hart #(
     assign o_retire_dmem_wen   = MEM_WB_dmem_wen;
     assign o_retire_dmem_rdata = MEM_WB_dmem_rdata;
     assign o_retire_dmem_wdata = MEM_WB_dmem_wdata;
+
+    // Phase 6 Floating-point retire signals
+    assign o_retire_frs1_raddr = (MEM_WB_valid && MEM_WB_frs1_en) ? MEM_WB_rs1 : 5'd0;
+    assign o_retire_frs1_rdata = (MEM_WB_valid && MEM_WB_frs1_en) ? MEM_WB_frs1_data : 32'd0;
+
+    assign o_retire_frs2_raddr = (MEM_WB_valid && MEM_WB_frs2_en) ? MEM_WB_rs2 : 5'd0;
+    assign o_retire_frs2_rdata = (MEM_WB_valid && MEM_WB_frs2_en) ? MEM_WB_frs2_data : 32'd0;
+
+    assign o_retire_frs3_raddr = (MEM_WB_valid && MEM_WB_frs3_en) ? MEM_WB_rs3 : 5'd0;
+    assign o_retire_frs3_rdata = (MEM_WB_valid && MEM_WB_frs3_en) ? MEM_WB_frs3_data : 32'd0;
+
+    assign o_retire_frd_wen    = actual_frd_wen;
+    assign o_retire_frd_waddr  = (!MEM_WB_valid || MEM_WB_trap) ? 5'd0 : MEM_WB_rd;
+    assign o_retire_frd_wdata  = actual_frd_wdata;
+
+    assign o_retire_fflags     = MEM_WB_fflags;
 
 endmodule
 

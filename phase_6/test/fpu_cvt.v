@@ -1,3 +1,6 @@
+`ifndef FPU_CVT_V
+`define FPU_CVT_V
+
 `default_nettype none
 
 module fpu_cvt (
@@ -64,3 +67,4 @@ module fpu_cvt (
 endmodule
 
 `default_nettype wire
+`endif

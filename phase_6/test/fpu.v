@@ -1,5 +1,12 @@
 `default_nettype none
 
+`include "fpu_shift_right_jam.v"
+`include "fpu_normalize.v"
+`include "fpu_round.v"
+`include "fpu_cvt.v"
+`include "fpu_fma.v"
+`include "fpu_div_sqrt.v"
+
 // The floating-point unit implements the RISC-V F extension (single
 // precision, IEEE 754-2008) and the Zicsr instructions for its control and
 // status register fcsr. It sits in the execute stage beside the ALU and the

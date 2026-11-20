@@ -1,3 +1,6 @@
+`ifndef FPU_ROUND_V
+`define FPU_ROUND_V
+
 `default_nettype none
 
 module fpu_round (
@@ -54,3 +57,4 @@ module fpu_round (
 endmodule
 
 `default_nettype wire
+`endif
