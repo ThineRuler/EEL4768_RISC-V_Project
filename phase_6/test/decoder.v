@@ -178,7 +178,7 @@ module decoder (
         r_alu_opsel = 3'b000;
         // Major opsel for the ALU. See ALU documentation for the encoding.
    
-   
+        r_alu_sub = 1'b0;
         r_alu_unsigned = 1'b0;
         r_alu_arith = 1'b0;
         r_branch = 1'b0;
@@ -352,7 +352,6 @@ module decoder (
                             r_legal = 1'b0;
                             end 
                         endcase
-                        r_frs2_en = r_legal;
 
                         end
                         
@@ -494,7 +493,7 @@ end
             OPCODE_FMSUB,
             OPCODE_FNMSUB,
             OPCODE_FNMADD: begin
-            r_legal = (i_inst[26:25] == 2'b00);
+            r_legal = (i_inst[26:25] == 2'b00) && (funct3 != 3'b101) && (funct3 != 3'b110);
             r_fpu   = r_legal;
             r_frs1_en = r_legal;
             r_frs2_en = r_legal;
@@ -511,6 +510,7 @@ end
                 r_branch_unsigned = funct3[1];
                 r_branch_invert   = funct3[0];
                 r_alu_unsigned    = funct3[1]; // Per spec section 8
+                r_alu_opsel       = funct3[1] ? 3'b011 : 3'b010;
     
                 // Legal funct3 for branches: 000, 001, 100, 101, 110, 111
                 case (funct3)
@@ -605,7 +605,7 @@ end
     assign o_rs3    = i_inst[31:27];
     assign o_legal = r_legal;
     assign o_halt = r_halt;
-    assign o_rd = (r_legal && r_rd_wen && !r_frd_en) ? rd : 5'b00000; // If instruction doesn't write to rd or is illegal, set to x0
+    assign o_rd = (r_legal && (r_rd_wen || r_frd_en)) ? rd : 5'b00000; // If instruction doesn't write to rd/frd or is illegal, set to 0
     assign o_op1_sel = r_op1_sel;
     assign o_op2_sel = r_op2_sel;
     assign o_alu_opsel = r_alu_opsel;

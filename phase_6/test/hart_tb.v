@@ -175,6 +175,8 @@ module hart_tb;
     endtask
 
     initial begin
+        $dumpfile("hart_tb.vcd");
+        $dumpvars(0, hart_tb);
         clk = 0;
         rst = 1;
         imem_valid = 0;

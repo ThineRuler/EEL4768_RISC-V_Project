@@ -158,6 +158,8 @@ module hart #(
     // IF Stage Signals
     // ------------------------------------------------------------------------
     reg  [31:0] PC;
+    reg         pending_flush;
+    reg  [31:0] pending_flush_pc;
     wire [31:0] nxt_instruct;
     wire [31:0] next_pc;
 
@@ -444,13 +446,29 @@ module hart #(
     assign next_pc      = flush ? EX_next_pc : nxt_instruct;
 
     always @(posedge i_clk) begin
-        if (i_rst)
+        if (i_rst) begin
             PC <= RESET_ADDR;
-        else if (dcache_stall)
+            pending_flush <= 1'b0;
+            pending_flush_pc <= 32'd0;
+        end else if (dcache_stall) begin
             PC <= PC;
-        else if (flush)
-            PC <= EX_next_pc;
-        else if (stall || icache_stall)
+        end else if (flush) begin
+            if (icache_stall) begin
+                PC <= PC;
+                pending_flush <= 1'b1;
+                pending_flush_pc <= EX_next_pc;
+            end else begin
+                PC <= EX_next_pc;
+                pending_flush <= 1'b0;
+            end
+        end else if (pending_flush) begin
+            if (!icache_stall) begin
+                PC <= pending_flush_pc;
+                pending_flush <= 1'b0;
+            end else begin
+                PC <= PC;
+            end
+        end else if (stall || icache_stall)
             PC <= PC;
         else
             PC <= nxt_instruct;
@@ -471,7 +489,7 @@ module hart #(
             IF_ID_instruct <= IF_ID_instruct;
             IF_ID_next_pc  <= IF_ID_next_pc;
             IF_ID_valid    <= IF_ID_valid;
-        end else if (flush) begin
+        end else if (flush || pending_flush) begin
             IF_ID_PC       <= 32'd0;
             IF_ID_instruct <= 32'h00000013; // Flushed bubble
             IF_ID_next_pc  <= 32'd0;
@@ -539,8 +557,8 @@ module hart #(
     // 3. Register File (RF) Linking
     // ========================================================================
 
-    // Writes to x0 or when trapped are discarded by gating actual_rd_waddr to 5'd0.
-    assign actual_rd_waddr = (!MEM_WB_valid || MEM_WB_trap) ? 5'd0 : MEM_WB_rd;
+    // Writes to x0, FP destinations, or when trapped are discarded by gating actual_rd_waddr to 5'd0.
+    assign actual_rd_waddr = (!MEM_WB_valid || MEM_WB_trap || MEM_WB_frd_en) ? 5'd0 : MEM_WB_rd;
     assign actual_frd_wen   = MEM_WB_valid && MEM_WB_frd_en && !MEM_WB_trap;
     assign actual_frd_waddr = MEM_WB_rd;
     assign actual_frd_wdata = (MEM_WB_rd_sel[3]) ? MEM_WB_mem_rdata : MEM_WB_fp_result;
@@ -580,7 +598,7 @@ module hart #(
         (inst_opcode == 7'b1100111) | // JALR
         (inst_opcode == 7'b0000111) | // LOAD_FP (flw)
         (inst_opcode == 7'b0100111) | // STORE_FP (fsw)
-        (r_fpu && !r_frs1_en)        // FPU reading integer rs1
+        (r_fpu && !r_frs1_en && !((inst_opcode == 7'b1110011) && IF_ID_instruct[14])) // FPU reading integer rs1
     );
 
     // rs2 is read only by OP, STORE, and BRANCH
@@ -872,6 +890,7 @@ module hart #(
          EX_MEM_valid &&
          EX_MEM_legal &&
          (!EX_MEM_halt) &&
+         (!EX_MEM_frd_en) &&
          (EX_MEM_rd != 5'd0) &&
          (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2] || EX_MEM_rd_sel[4]) &&
          (EX_MEM_rd == ID_EX_rs1))
@@ -882,6 +901,7 @@ module hart #(
          MEM_WB_valid &&
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
+         (!MEM_WB_frd_en) &&
          (MEM_WB_rd != 5'd0) &&
          (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == ID_EX_rs1))
@@ -896,6 +916,7 @@ module hart #(
          EX_MEM_valid &&
          EX_MEM_legal &&
          (!EX_MEM_halt) &&
+         (!EX_MEM_frd_en) &&
          (EX_MEM_rd != 5'd0) &&
          (EX_MEM_rd_sel[0] || EX_MEM_rd_sel[1] || EX_MEM_rd_sel[2] || EX_MEM_rd_sel[4]) &&
          (EX_MEM_rd == ID_EX_rs2))
@@ -906,6 +927,7 @@ module hart #(
          MEM_WB_valid &&
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
+         (!MEM_WB_frd_en) &&
          (MEM_WB_rd != 5'd0) &&
          (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == ID_EX_rs2))
@@ -1110,7 +1132,7 @@ module hart #(
             EX_MEM_rs3         <= EX_MEM_rs3;
             EX_MEM_frd_en      <= EX_MEM_frd_en;
             EX_MEM_frs1_data   <= EX_MEM_frs1_data;
-            EX_MEM_frs2_data   <= EX_MEM_frs2_data;
+            EX_MEM_frs2_data   <= r_fstore_data;
             EX_MEM_frs3_data   <= EX_MEM_frs3_data;
             EX_MEM_fp_result   <= EX_MEM_fp_result;
             EX_MEM_fflags      <= EX_MEM_fflags;
@@ -1211,6 +1233,7 @@ module hart #(
          MEM_WB_valid &&
          (!MEM_WB_trap) &&
          (!MEM_WB_halt) &&
+         (!MEM_WB_frd_en) &&
          (MEM_WB_rd != 5'd0) &&
          (MEM_WB_rd_sel != 5'd0) &&
          (MEM_WB_rd == EX_MEM_rs2))
@@ -1441,8 +1464,8 @@ module hart #(
     assign o_retire_rs2_raddr = (MEM_WB_valid && MEM_WB_rs2_is_read && (!MEM_WB_trap || MEM_WB_legal)) ? MEM_WB_rs2 : 5'd0;
     assign o_retire_rs2_rdata = (MEM_WB_valid && MEM_WB_rs2_is_read) ? MEM_WB_rs2_data : 32'd0;
 
-    // On trap, no register write: rd_waddr is 5'd0 (Section 4.5.1)
-    assign o_retire_rd_waddr  = (!MEM_WB_valid || MEM_WB_trap) ? 5'd0 : MEM_WB_rd;
+    // On trap or FP write, no integer register write: rd_waddr is 5'd0 (Section 4.5.1)
+    assign o_retire_rd_waddr  = (!MEM_WB_valid || MEM_WB_trap || MEM_WB_frd_en) ? 5'd0 : MEM_WB_rd;
     assign o_retire_rd_wdata  = rd_data;
 
     assign o_retire_pc        = MEM_WB_PC;
