@@ -59,7 +59,9 @@ module fpu (
     // Asserted when a rounding instruction selects the dynamic rounding mode
     // (rm = 111) while frm holds a reserved value (101-111). The instruction
     // traps as illegal and changes no state.
-    output wire        o_rm_trap
+    output wire        o_rm_trap,
+    // Architectural FCSR provided directly by OoO core (eliminates CSR sync stalls).
+    input  wire [ 7:0] i_arch_fcsr
 );
 
     // Decode only this slice. i_valid comes from the Phase 6 decoder.
@@ -136,7 +138,7 @@ module fpu (
                       (funct3[1:0] != 2'b00);
     wire csr_replace = (funct3[1:0] == 2'b01);
     wire csr_write = csr_access && (csr_replace || (csr_src_field != 5'd0));
-    reg [7:0] fcsr;
+    wire [7:0] fcsr = i_arch_fcsr;
     wire [7:0] csr_old = csr_is_flags ? {3'd0, fcsr[4:0]} :
                          csr_is_frm   ? {5'd0, fcsr[7:5]} : fcsr;
     wire [7:0] csr_src = funct3[2] ? {3'd0, csr_src_field} :
@@ -219,21 +221,16 @@ module fpu (
     // Report the flags after the EX instruction, but commit only on advance.
     wire invalid = (compare && ((funct3 == 3'd2) ? any_snan : any_nan)) ||
                    (min_max && any_snan);
-    wire [4:0] flags_next = fcsr[4:0] | {invalid, 4'd0} | (cvt_valid ? cvt_flags : 5'd0) |
-                            (fma_valid ? fma_flags : 5'd0) |
-                            (div_sqrt_valid ? div_sqrt_flags : 5'd0);
+    wire [4:0] op_flags = {invalid, 4'd0} | (cvt_valid ? cvt_flags : 5'd0) |
+                          (fma_valid ? fma_flags : 5'd0) |
+                          (div_sqrt_valid ? div_sqrt_flags : 5'd0);
+    wire [4:0] flags_next = fcsr[4:0] | op_flags;
     wire [7:0] fcsr_next = o_rm_trap ? fcsr :
                            !csr_write ? {fcsr[7:5], flags_next} :
                            csr_is_flags ? {fcsr[7:5], csr_new[4:0]} :
                            csr_is_frm ? {csr_new[2:0], fcsr[4:0]} : csr_new;
-    assign o_fflags = fcsr_next[4:0];
-
-    always @(posedge i_clk) begin
-        if (i_rst)
-            fcsr <= 8'd0;
-        else if (i_valid && i_advance && !o_busy)
-            fcsr <= fcsr_next;
-    end
+    assign o_fflags = o_rm_trap ? fcsr[4:0] :
+                      csr_access ? fcsr_next[4:0] : op_flags;
 
 
 endmodule

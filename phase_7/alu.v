@@ -452,14 +452,14 @@ assign mul_result =
 
 
 //*********************************
-// RV32M RESTORING DIVIDER
+// RV32M FAST RADIX-16 + CLZ DIVIDER (4 bits/cycle + leading-zero skip)
 //*********************************
 localparam [1:0] DIV_IDLE = 2'b00;
 localparam [1:0] DIV_RUN  = 2'b01;
 localparam [1:0] DIV_DONE = 2'b10;
 
-reg [1:0] div_state;
-reg [5:0] div_count;
+reg [1:0]  div_state;
+reg [3:0]  div_steps;
 reg [31:0] div_quotient;
 reg [32:0] div_remainder;
 reg [31:0] div_divisor;
@@ -469,17 +469,9 @@ reg        div_quotient_negative;
 reg        div_remainder_negative;
 reg [31:0] div_result_reg;
 
-wire [32:0] div_shifted_remainder;
-wire [31:0] div_shifted_quotient;
-wire [32:0] div_subtracted_remainder;
-wire        div_step_take;
-wire [32:0] div_next_remainder;
-wire [31:0] div_next_quotient;
-wire [31:0] div_corrected_quotient;
-wire [31:0] div_corrected_remainder;
+wire        div_request;
 wire [31:0] div_abs_op1;
 wire [31:0] div_abs_op2;
-wire        div_request;
 
 assign div_request = i_mext && i_opsel[2];
 assign div_abs_op1 =
@@ -487,26 +479,59 @@ assign div_abs_op1 =
 assign div_abs_op2 =
     (i_opsel[0] == 1'b0 && i_op2[31]) ? (~i_op2 + 32'd1) : i_op2;
 
-assign div_shifted_remainder = {div_remainder[31:0], div_quotient[31]};
-assign div_shifted_quotient  = {div_quotient[30:0], 1'b0};
-assign div_subtracted_remainder =
-    div_shifted_remainder - {1'b0, div_divisor};
-assign div_step_take = ~div_subtracted_remainder[32];
-assign div_next_remainder =
-    div_step_take ? div_subtracted_remainder : div_shifted_remainder;
-assign div_next_quotient =
-    {div_quotient[30:0], div_step_take};
+// Leading-zero nibble skip for fast start (constant shifts only)
+wire [3:0] div_init_steps =
+    (|div_abs_op1[31:28]) ? 4'd8 :
+    (|div_abs_op1[27:24]) ? 4'd7 :
+    (|div_abs_op1[23:20]) ? 4'd6 :
+    (|div_abs_op1[19:16]) ? 4'd5 :
+    (|div_abs_op1[15:12]) ? 4'd4 :
+    (|div_abs_op1[11:8])  ? 4'd3 :
+    (|div_abs_op1[7:4])   ? 4'd2 : 4'd1;
 
-assign div_corrected_quotient =
+wire [31:0] div_init_quot =
+    (|div_abs_op1[31:28]) ? div_abs_op1 :
+    (|div_abs_op1[27:24]) ? {div_abs_op1[27:0],  4'd0} :
+    (|div_abs_op1[23:20]) ? {div_abs_op1[23:0],  8'd0} :
+    (|div_abs_op1[19:16]) ? {div_abs_op1[19:0], 12'd0} :
+    (|div_abs_op1[15:12]) ? {div_abs_op1[15:0], 16'd0} :
+    (|div_abs_op1[11:8])  ? {div_abs_op1[11:0], 20'd0} :
+    (|div_abs_op1[7:4])   ? {div_abs_op1[7:0],  24'd0} :
+                            {div_abs_op1[3:0],  28'd0};
+
+// 4 chained 1-bit restoring steps per cycle (34-bit sub to handle divisor >= 2^31)
+wire [33:0] div_rem0_sh  = {1'b0, div_remainder[31:0], div_quotient[31]};
+wire [33:0] div_sub0     = div_rem0_sh - {2'b00, div_divisor};
+wire        div_b0       = ~div_sub0[33];
+wire [32:0] div_rem0     = div_b0 ? div_sub0[32:0] : div_rem0_sh[32:0];
+
+wire [33:0] div_rem1_sh  = {1'b0, div_rem0[31:0], div_quotient[30]};
+wire [33:0] div_sub1     = div_rem1_sh - {2'b00, div_divisor};
+wire        div_b1       = ~div_sub1[33];
+wire [32:0] div_rem1     = div_b1 ? div_sub1[32:0] : div_rem1_sh[32:0];
+
+wire [33:0] div_rem2_sh  = {1'b0, div_rem1[31:0], div_quotient[29]};
+wire [33:0] div_sub2     = div_rem2_sh - {2'b00, div_divisor};
+wire        div_b2       = ~div_sub2[33];
+wire [32:0] div_rem2     = div_b2 ? div_sub2[32:0] : div_rem2_sh[32:0];
+
+wire [33:0] div_rem3_sh  = {1'b0, div_rem2[31:0], div_quotient[28]};
+wire [33:0] div_sub3     = div_rem3_sh - {2'b00, div_divisor};
+wire        div_b3       = ~div_sub3[33];
+wire [32:0] div_next_remainder = div_b3 ? div_sub3[32:0] : div_rem3_sh[32:0];
+
+wire [31:0] div_next_quotient = {div_quotient[27:0], div_b0, div_b1, div_b2, div_b3};
+
+wire [31:0] div_corrected_quotient =
     div_quotient_negative ? (~div_next_quotient + 32'd1) : div_next_quotient;
-assign div_corrected_remainder =
+wire [31:0] div_corrected_remainder =
     div_remainder_negative ? (~div_next_remainder[31:0] + 32'd1) :
                              div_next_remainder[31:0];
 
 always @(posedge i_clk) begin
     if (i_rst) begin
         div_state <= DIV_IDLE;
-        div_count <= 6'd0;
+        div_steps <= 4'd0;
         div_quotient <= 32'd0;
         div_remainder <= 33'd0;
         div_divisor <= 32'd0;
@@ -524,7 +549,6 @@ always @(posedge i_clk) begin
                     div_quotient_negative <= (~i_opsel[0]) &&
                                              (i_op1[31] ^ i_op2[31]);
                     div_remainder_negative <= (~i_opsel[0]) && i_op1[31];
-                    div_count <= 6'd0;
                     div_remainder <= 33'd0;
 
                     if (i_op2 == 32'd0) begin
@@ -540,9 +564,13 @@ always @(posedge i_clk) begin
                                  (i_op2 == 32'hFFFFFFFF)) begin
                         div_result_reg <= 32'd0;
                         div_state <= DIV_DONE;
+                    end else if (div_abs_op1 < div_abs_op2) begin
+                        div_result_reg <= i_opsel[1] ? i_op1 : 32'd0;
+                        div_state <= DIV_DONE;
                     end else begin
-                        div_quotient <= div_abs_op1;
+                        div_quotient <= div_init_quot;
                         div_divisor <= div_abs_op2;
+                        div_steps <= div_init_steps;
                         div_state <= DIV_RUN;
                     end
                 end
@@ -551,9 +579,9 @@ always @(posedge i_clk) begin
             DIV_RUN: begin
                 div_remainder <= div_next_remainder;
                 div_quotient <= div_next_quotient;
-                div_count <= div_count + 6'd1;
+                div_steps <= div_steps - 4'd1;
 
-                if (div_count == 6'd31) begin
+                if (div_steps == 4'd1) begin
                     div_result_reg <= div_is_rem ?
                         div_corrected_remainder : div_corrected_quotient;
                     div_state <= DIV_DONE;

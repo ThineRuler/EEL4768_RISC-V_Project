@@ -1,11 +1,14 @@
 `default_nettype none
 
-// Tomasulo-style Out-of-Order RV32IMF CPU (Phase 7)
-// - Combinational instruction memory fetch (o_imem_raddr / i_imem_rdata)
-// - Non-speculative control flow (ctrl_inflight stalls issue until branch/jump resolves)
-// - 8-entry ROB, 4-entry INT ALU RS, 4-entry FP RS, 8-entry in-order LSU
-// - Separate INT & FP RATs (rat.v), single CDB with age arbitration (cdb_arb.v)
-// - Dual FPU instances (fpu.v) + Phase 5 data cache (cache/cache.v) on LSU
+// Tomasulo-style Speculative Out-of-Order RV32IMF CPU (Phase 8 / Optimized Phase 7)
+// - Dynamic Branch Prediction: 64-entry BTB + 128-entry Gshare 2-bit PHT + 8-entry RAS
+//   + Decode fallback for cold JAL / JALR / backward branches
+// - Speculative OoO execution across unresolved branches with 1-cycle mispredict flush
+//   and 1-cycle ROB-based speculative INT/FP RAT recovery
+// - 8-entry ROB, 8-entry INT ALU RS, 8-entry FP RS, 8-entry OoO-Load LSU
+// - Dual INT ALUs (alu_0 + alu_1) + Dedicated Radix-16+CLZ DIV unit (div_unit)
+// - Dual fast FPUs (fpu.v with direct i_arch_fcsr + Radix-16 fpu_div_sqrt)
+// - Non-blocking 4-MSHR Data Cache (cache.v) with OoO Load execution & Store-to-Load forwarding
 module hart #(
     parameter RESET_ADDR     = 32'h00000000,
     parameter BYPASS_EN      = 1,
@@ -79,22 +82,57 @@ module hart #(
 );
 
     localparam ROB_SIZE    = 8;
-    localparam ALU_RS_SIZE = 4;
-    localparam FP_RS_SIZE  = 4;
+    localparam ALU_RS_SIZE = 8;
+    localparam FP_RS_SIZE  = 8;
     localparam LSU_SIZE    = 8;
     localparam TAG_W       = 3;
 
+    localparam OFFSET_BITS = $clog2(BLOCK_SIZE);
+    localparam WORD_BITS   = (OFFSET_BITS > 2) ? (OFFSET_BITS - 2) : 1;
+
+    localparam [1:0] LD_WAIT = 2'd0;
+    localparam [1:0] LD_MISS = 2'd1;
+    localparam [1:0] LD_CDB  = 2'd2;
+    localparam [1:0] LD_DONE = 2'd3;
+
     // ========================================================================
-    // 1. Frontend: PC, Combinational IMEM, IF/ID Register
+    // 1. Frontend: PC, BTB (64) + Gshare PHT (128) + RAS (8), IF/ID
     // ========================================================================
     reg  [31:0] PC;
     reg  [31:0] IF_ID_PC;
     reg  [31:0] IF_ID_instruct;
     reg         IF_ID_valid;
-    reg         ctrl_inflight;
+    reg         IF_ID_pred_taken;
+    reg  [31:0] IF_ID_pred_pc;
+    reg         IF_ID_btb_hit;
+    reg  [ 6:0] IF_ID_ghr;
     reg         halted_issued;
 
-    wire [31:0] pc_plus_4 = PC + 32'd4;
+    // Branch Target Buffer (64 entries, direct-mapped by PC[7:2])
+    reg         btb_valid  [0:63];
+    reg  [23:0] btb_tag    [0:63];
+    reg  [31:0] btb_target [0:63];
+    reg         btb_uncond [0:63];
+    reg         btb_is_ret [0:63];
+
+    // Gshare 2-bit Saturating Counter Table (128 entries) + 7-bit GHR
+    reg  [ 1:0] pht [0:127];
+    reg  [ 6:0] ghr;
+
+    // Return Address Stack (8 entries)
+    reg  [31:0] ras_stack [0:7];
+    reg  [ 2:0] ras_sp;
+
+    wire [31:0] pc_plus_4       = PC + 32'd4;
+    wire [ 5:0] fetch_btb_idx   = PC[7:2];
+    wire        fetch_btb_hit   = btb_valid[fetch_btb_idx] && (btb_tag[fetch_btb_idx] == PC[31:8]);
+    wire [ 6:0] fetch_pht_idx   = PC[8:2] ^ ghr;
+    wire        fetch_pht_taken = pht[fetch_pht_idx][1];
+    wire        fetch_pred_taken = fetch_btb_hit && (btb_uncond[fetch_btb_idx] || fetch_pht_taken);
+    wire [ 2:0] fetch_ras_top   = ras_sp - 3'd1;
+    wire [31:0] fetch_pred_target = btb_is_ret[fetch_btb_idx] ? ras_stack[fetch_ras_top] : btb_target[fetch_btb_idx];
+    wire [31:0] fetch_next_pc   = fetch_pred_taken ? fetch_pred_target : pc_plus_4;
+
     assign o_imem_raddr = PC;
 
     // ========================================================================
@@ -174,21 +212,21 @@ module hart #(
     wire [6:0] inst_opcode = IF_ID_instruct[6:0];
 
     wire rs1_is_read = r_legal & (
-        (inst_opcode == 7'b0110011) | // OP
-        (inst_opcode == 7'b0010011) | // OP-IMM
-        (inst_opcode == 7'b0000011) | // LOAD
-        (inst_opcode == 7'b0100011) | // STORE
-        (inst_opcode == 7'b1100011) | // BRANCH
-        (inst_opcode == 7'b1100111) | // JALR
-        (inst_opcode == 7'b0000111) | // LOAD_FP
-        (inst_opcode == 7'b0100111) | // STORE_FP
+        (inst_opcode == 7'b0110011) |
+        (inst_opcode == 7'b0010011) |
+        (inst_opcode == 7'b0000011) |
+        (inst_opcode == 7'b0100011) |
+        (inst_opcode == 7'b1100011) |
+        (inst_opcode == 7'b1100111) |
+        (inst_opcode == 7'b0000111) |
+        (inst_opcode == 7'b0100111) |
         (r_fpu && !r_frs1_en && !((inst_opcode == 7'b1110011) && IF_ID_instruct[14]))
     );
 
     wire rs2_is_read = r_legal & (
-        (inst_opcode == 7'b0110011) | // OP
-        (inst_opcode == 7'b0100011) | // STORE
-        (inst_opcode == 7'b1100011)   // BRANCH
+        (inst_opcode == 7'b0110011) |
+        (inst_opcode == 7'b0100011) |
+        (inst_opcode == 7'b1100011)
     );
 
     wire cls_illegal_or_halt = !r_legal || r_halt;
@@ -247,13 +285,18 @@ module hart #(
     reg  [31:0] rob_dmem_rdata  [0:ROB_SIZE-1];
     reg  [31:0] rob_dmem_wdata  [0:ROB_SIZE-1];
 
+    // Branch-prediction & speculation checkpoints per ROB entry
+    reg  [31:0] rob_pred_pc     [0:ROB_SIZE-1];
+    reg  [ 6:0] rob_ghr_ckpt    [0:ROB_SIZE-1];
+    reg  [ 2:0] rob_ras_sp_ckpt [0:ROB_SIZE-1];
+    reg         rob_is_call     [0:ROB_SIZE-1];
+    reg         rob_is_ret      [0:ROB_SIZE-1];
+
     wire rob_full  = (rob_count == 4'd8);
     wire rob_empty = (rob_count == 4'd0);
 
-    // Architectural FCSR (authoritative at ROB commit)
     reg  [ 7:0] arch_fcsr;
 
-    // Forward declarations for CDB, RS, LSU, Cache
     wire        cdb_valid;
     wire [ 2:0] cdb_tag;
     wire [ 4:0] cdb_rd;
@@ -265,15 +308,13 @@ module hart #(
     wire        fp_rs_full;
     wire        lsu_full;
     wire        dcache_ready;
+    wire        mispredict_fire;
 
-    // Store commit needs D-cache ready (if non-trapping)
     wire rob_commit_store_req = rob_valid[rob_head] && rob_done[rob_head] &&
                                 rob_is_store[rob_head] && !rob_trap[rob_head];
     wire rob_commit = rob_valid[rob_head] && rob_done[rob_head] &&
                       (!rob_is_store[rob_head] || rob_trap[rob_head] || dcache_ready);
 
-    // On trapped instructions that had renamed a destination (e.g. misaligned lw/flw or fpu_rm_trap),
-    // restore architectural RF[rd] to any younger dependent instructions during commit cycle.
     wire trap_wb_needed = rob_valid[rob_head] && rob_done[rob_head] &&
                           rob_trap[rob_head] && (rob_int_wen[rob_head] || rob_frd_en[rob_head]);
     wire trap_wb_stall  = trap_wb_needed;
@@ -282,16 +323,15 @@ module hart #(
     wire issue_stall = IF_ID_valid && (
         halted_issued ||
         trap_wb_stall ||
-        ctrl_inflight ||
         rob_full ||
         ((cls_alu || cls_brjmp) && alu_rs_full) ||
         (cls_fpu && fp_rs_full) ||
         (cls_mem && lsu_full)
     );
-    wire issue_fire = IF_ID_valid && !issue_stall;
+    wire issue_fire = IF_ID_valid && !issue_stall && !mispredict_fire;
 
     // ========================================================================
-    // 4. Register File & Register Alias Tables (INT & FP)
+    // 4. Register File & Speculative Register Alias Tables (1-cycle ROB recovery)
     // ========================================================================
     wire [31:0] rs1_data, rs2_data, frs1_data, frs2_data, frs3_data;
     wire [ 4:0] rf_rs1_raddr  = trap_wb_stall ? rob_rd[rob_head] : r_rs1;
@@ -325,50 +365,22 @@ module hart #(
 
     wire [31:0] trap_wb_val = rob_frd_en[rob_head] ? frs1_data : rs1_data;
 
-    wire        rat_int_busy1, rat_int_busy2;
-    wire [ 2:0] rat_int_tag1,  rat_int_tag2;
-    wire        rat_fp_busy1,  rat_fp_busy2, rat_fp_busy3;
-    wire [ 2:0] rat_fp_tag1,   rat_fp_tag2,  rat_fp_tag3;
+    reg  [31:0] spec_int_busy;
+    reg  [ 2:0] spec_int_tag [0:31];
+    reg  [31:0] spec_fp_busy;
+    reg  [ 2:0] spec_fp_tag  [0:31];
 
-    rat #(.TAG_W(3), .ZERO_REG(1)) rat_int (
-        .i_clk        (i_clk),
-        .i_rst        (i_rst),
-        .i_raddr1     (r_rs1),
-        .o_busy1      (rat_int_busy1),
-        .o_tag1       (rat_int_tag1),
-        .i_raddr2     (r_rs2),
-        .o_busy2      (rat_int_busy2),
-        .o_tag2       (rat_int_tag2),
-        .i_raddr3     (5'd0),
-        .o_busy3      (),
-        .o_tag3       (),
-        .i_issue_en   (issue_fire && !r_frd_en && (r_rd != 5'd0)),
-        .i_issue_rd   (r_rd),
-        .i_issue_tag  (rob_tail),
-        .i_commit_en  (rob_commit && !rob_frd_en[rob_head] && (rob_rd[rob_head] != 5'd0)),
-        .i_commit_rd  (rob_rd[rob_head]),
-        .i_commit_tag (rob_head)
-    );
+    wire        rat_int_busy1 = (r_rs1 == 5'd0) ? 1'b0 : spec_int_busy[r_rs1];
+    wire [ 2:0] rat_int_tag1  = (r_rs1 == 5'd0) ? 3'd0 : spec_int_tag[r_rs1];
+    wire        rat_int_busy2 = (r_rs2 == 5'd0) ? 1'b0 : spec_int_busy[r_rs2];
+    wire [ 2:0] rat_int_tag2  = (r_rs2 == 5'd0) ? 3'd0 : spec_int_tag[r_rs2];
 
-    rat #(.TAG_W(3), .ZERO_REG(0)) rat_fp (
-        .i_clk        (i_clk),
-        .i_rst        (i_rst),
-        .i_raddr1     (r_rs1),
-        .o_busy1      (rat_fp_busy1),
-        .o_tag1       (rat_fp_tag1),
-        .i_raddr2     (r_rs2),
-        .o_busy2      (rat_fp_busy2),
-        .o_tag2       (rat_fp_tag2),
-        .i_raddr3     (r_rs3),
-        .o_busy3      (rat_fp_busy3),
-        .o_tag3       (rat_fp_tag3),
-        .i_issue_en   (issue_fire && r_frd_en),
-        .i_issue_rd   (r_rd),
-        .i_issue_tag  (rob_tail),
-        .i_commit_en  (rob_commit && rob_frd_en[rob_head]),
-        .i_commit_rd  (rob_rd[rob_head]),
-        .i_commit_tag (rob_head)
-    );
+    wire        rat_fp_busy1  = spec_fp_busy[r_rs1];
+    wire [ 2:0] rat_fp_tag1   = spec_fp_tag[r_rs1];
+    wire        rat_fp_busy2  = spec_fp_busy[r_rs2];
+    wire [ 2:0] rat_fp_tag2   = spec_fp_tag[r_rs2];
+    wire        rat_fp_busy3  = spec_fp_busy[r_rs3];
+    wire [ 2:0] rat_fp_tag3   = spec_fp_tag[r_rs3];
 
     // ========================================================================
     // 5. Issue Operand Resolution (RF / ROB / Same-Cycle CDB Bypass / Q-tag)
@@ -414,8 +426,27 @@ module hart #(
                               op3_on_cdb ? cdb_val :
                                            32'd0;
 
+    // Decode-stage fallback predictor (for cold BTB misses on JAL / ready JALR / backward branch)
+    wire        dec_is_jal       = r_legal && r_jump && !r_pc_sel;
+    wire        dec_is_jalr_rdy  = r_legal && r_jump && r_pc_sel && !iss_op1_qv;
+    wire        dec_cold_bwd_br  = r_legal && r_branch && !IF_ID_btb_hit && !IF_ID_pred_taken && r_immediate[31];
+    wire        dec_override_taken = dec_is_jal || dec_is_jalr_rdy || dec_cold_bwd_br;
+    wire [31:0] dec_override_target = dec_is_jalr_rdy ? ((iss_op1_val + r_immediate) & ~32'd1) :
+                                                        (IF_ID_PC + r_immediate);
+    wire        dec_target_valid = (dec_override_target[1:0] == 2'b00);
+    wire        dec_redirect     = issue_fire && dec_override_taken && dec_target_valid &&
+                                   (!IF_ID_pred_taken || (IF_ID_pred_pc != dec_override_target));
+
+    wire        iss_pred_taken   = (dec_override_taken && dec_target_valid) ? 1'b1 : IF_ID_pred_taken;
+    wire [31:0] iss_pred_pc      = (dec_override_taken && dec_target_valid) ? dec_override_target :
+                                   IF_ID_pred_taken                         ? IF_ID_pred_pc :
+                                                                              (IF_ID_PC + 32'd4);
+
+    wire iss_is_call = r_legal && r_jump && ((r_rd == 5'd1) || (r_rd == 5'd5));
+    wire iss_is_ret  = r_legal && r_jump && r_pc_sel && ((r_rs1 == 5'd1) || (r_rs1 == 5'd5)) && (r_rd != r_rs1);
+
     // ========================================================================
-    // 6. INT ALU Reservation Station (4 entries) + Shared ALU + Registered CDB
+    // 6. INT ALU Reservation Station (8 entries) + Dual ALUs + Dedicated DIV Unit
     // ========================================================================
     reg         alu_rs_valid       [0:ALU_RS_SIZE-1];
     reg  [ 2:0] alu_rs_tag         [0:ALU_RS_SIZE-1];
@@ -442,118 +473,269 @@ module hart #(
     reg         alu_rs_q2_v        [0:ALU_RS_SIZE-1];
     reg  [ 2:0] alu_rs_q2_t        [0:ALU_RS_SIZE-1];
 
-    assign alu_rs_full = alu_rs_valid[0] && alu_rs_valid[1] && alu_rs_valid[2] && alu_rs_valid[3];
+    assign alu_rs_full =
+        alu_rs_valid[0] && alu_rs_valid[1] && alu_rs_valid[2] && alu_rs_valid[3] &&
+        alu_rs_valid[4] && alu_rs_valid[5] && alu_rs_valid[6] && alu_rs_valid[7];
 
-    wire [1:0] alu_rs_free_idx =
-        !alu_rs_valid[0] ? 2'd0 :
-        !alu_rs_valid[1] ? 2'd1 :
-        !alu_rs_valid[2] ? 2'd2 :
-                           2'd3;
+    wire [2:0] alu_rs_free_idx =
+        !alu_rs_valid[0] ? 3'd0 :
+        !alu_rs_valid[1] ? 3'd1 :
+        !alu_rs_valid[2] ? 3'd2 :
+        !alu_rs_valid[3] ? 3'd3 :
+        !alu_rs_valid[4] ? 3'd4 :
+        !alu_rs_valid[5] ? 3'd5 :
+        !alu_rs_valid[6] ? 3'd6 : 3'd7;
 
-    // Ready status with CDB -> ALU RS operand bypass
-    wire [3:0] alu_rs_ready;
-    wire [2:0] alu_rs_age [0:3];
-    genvar ak;
+    wire [7:0] alu_rs_ready;
+    wire [7:0] alu_rs_is_div;
+    wire [7:0] alu_rs_is_brj;
+    wire [2:0] alu_rs_age [0:7];
+    genvar ak, aj;
     generate
-        for (ak = 0; ak < 4; ak = ak + 1) begin : gen_alu_rs_rdy
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_alu_rs_rdy
             wire q1_rdy = !alu_rs_q1_v[ak] || (cdb_valid && (cdb_tag == alu_rs_q1_t[ak]));
             wire q2_rdy = !alu_rs_q2_v[ak] || (cdb_valid && (cdb_tag == alu_rs_q2_t[ak]));
-            assign alu_rs_ready[ak] = alu_rs_valid[ak] && q1_rdy && q2_rdy;
-            assign alu_rs_age[ak]   = alu_rs_tag[ak] - rob_head;
+            assign alu_rs_ready[ak]  = alu_rs_valid[ak] && q1_rdy && q2_rdy;
+            assign alu_rs_is_div[ak] = alu_rs_mext[ak] && alu_rs_opsel[ak][2];
+            assign alu_rs_is_brj[ak] = alu_rs_branch[ak] || alu_rs_jump[ak];
+            assign alu_rs_age[ak]    = alu_rs_tag[ak] - rob_head;
         end
     endgenerate
 
-    // Oldest-ready selection
-    wire alu_pick0 = alu_rs_ready[0] &&
-                     (!alu_rs_ready[1] || (alu_rs_age[0] <= alu_rs_age[1])) &&
-                     (!alu_rs_ready[2] || (alu_rs_age[0] <= alu_rs_age[2])) &&
-                     (!alu_rs_ready[3] || (alu_rs_age[0] <= alu_rs_age[3]));
-    wire alu_pick1 = !alu_pick0 && alu_rs_ready[1] &&
-                     (!alu_rs_ready[2] || (alu_rs_age[1] <= alu_rs_age[2])) &&
-                     (!alu_rs_ready[3] || (alu_rs_age[1] <= alu_rs_age[3]));
-    wire alu_pick2 = !alu_pick0 && !alu_pick1 && alu_rs_ready[2] &&
-                     (!alu_rs_ready[3] || (alu_rs_age[2] <= alu_rs_age[3]));
-    wire alu_pick3 = !alu_pick0 && !alu_pick1 && !alu_pick2 && alu_rs_ready[3];
+    // ALU0: oldest ready non-div (handles branches/jumps + ALU + MUL)
+    wire [7:0] alu0_elig;
+    wire [7:0] alu0_pick;
+    generate
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_alu0_elig
+            assign alu0_elig[ak] = alu_rs_ready[ak] && !alu_rs_is_div[ak];
+        end
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_alu0_pick
+            wire [7:0] beaten;
+            for (aj = 0; aj < 8; aj = aj + 1) begin : gen_alu0_cmp
+                if (aj == ak) begin : gen_s
+                    assign beaten[aj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] AJ_I = aj;
+                    localparam [2:0] AK_I = ak;
+                    assign beaten[aj] = alu0_elig[aj] &&
+                        ((alu_rs_age[aj] < alu_rs_age[ak]) ||
+                         ((alu_rs_age[aj] == alu_rs_age[ak]) && (AJ_I < AK_I)));
+                end
+            end
+            assign alu0_pick[ak] = alu0_elig[ak] && !(|beaten);
+        end
+    endgenerate
 
-    reg        alu_div_active;
-    reg  [1:0] alu_div_slot;
+    wire       alu0_sel_valid = |alu0_elig;
+    wire [2:0] alu0_sel_slot  =
+        alu0_pick[0] ? 3'd0 : alu0_pick[1] ? 3'd1 : alu0_pick[2] ? 3'd2 : alu0_pick[3] ? 3'd3 :
+        alu0_pick[4] ? 3'd4 : alu0_pick[5] ? 3'd5 : alu0_pick[6] ? 3'd6 : 3'd7;
 
-    wire       alu_sel_valid = alu_div_active || (|alu_rs_ready);
-    wire [1:0] alu_sel_slot  = alu_div_active ? alu_div_slot :
-                               alu_pick0 ? 2'd0 :
-                               alu_pick1 ? 2'd1 :
-                               alu_pick2 ? 2'd2 : 2'd3;
+    // ALU1: oldest ready non-div, non-branch/jump excluding alu0_sel_slot
+    wire [7:0] alu1_elig;
+    wire [7:0] alu1_pick;
+    generate
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_alu1_elig
+            localparam [2:0] AK_I = ak;
+            assign alu1_elig[ak] = alu_rs_ready[ak] && !alu_rs_is_div[ak] && !alu_rs_is_brj[ak] &&
+                                   !(alu0_sel_valid && (alu0_sel_slot == AK_I));
+        end
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_alu1_pick
+            wire [7:0] beaten;
+            for (aj = 0; aj < 8; aj = aj + 1) begin : gen_alu1_cmp
+                if (aj == ak) begin : gen_s
+                    assign beaten[aj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] AJ_I = aj;
+                    localparam [2:0] AK_I = ak;
+                    assign beaten[aj] = alu1_elig[aj] &&
+                        ((alu_rs_age[aj] < alu_rs_age[ak]) ||
+                         ((alu_rs_age[aj] == alu_rs_age[ak]) && (AJ_I < AK_I)));
+                end
+            end
+            assign alu1_pick[ak] = alu1_elig[ak] && !(|beaten);
+        end
+    endgenerate
 
-    // Registered ALU CDB output buffer
-    reg        alu_cdb_v;
-    reg  [2:0] alu_cdb_tag;
-    reg  [4:0] alu_cdb_rd;
-    reg  [31:0] alu_cdb_val;
-    reg  [31:0] alu_cdb_pc;
+    wire       alu1_sel_valid = |alu1_elig;
+    wire [2:0] alu1_sel_slot  =
+        alu1_pick[0] ? 3'd0 : alu1_pick[1] ? 3'd1 : alu1_pick[2] ? 3'd2 : alu1_pick[3] ? 3'd3 :
+        alu1_pick[4] ? 3'd4 : alu1_pick[5] ? 3'd5 : alu1_pick[6] ? 3'd6 : 3'd7;
 
-    wire alu_cdb_can_accept = !alu_cdb_v || o_alu_gnt;
+    // DIV unit: oldest ready div (holds active slot until completion)
+    reg        div_active;
+    reg  [2:0] div_active_slot;
+    wire [7:0] div_elig;
+    wire [7:0] div_pick;
+    generate
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_div_elig
+            assign div_elig[ak] = alu_rs_ready[ak] && alu_rs_is_div[ak];
+        end
+        for (ak = 0; ak < 8; ak = ak + 1) begin : gen_div_pick
+            wire [7:0] beaten;
+            for (aj = 0; aj < 8; aj = aj + 1) begin : gen_div_cmp
+                if (aj == ak) begin : gen_s
+                    assign beaten[aj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] AJ_I = aj;
+                    localparam [2:0] AK_I = ak;
+                    assign beaten[aj] = div_elig[aj] &&
+                        ((alu_rs_age[aj] < alu_rs_age[ak]) ||
+                         ((alu_rs_age[aj] == alu_rs_age[ak]) && (AJ_I < AK_I)));
+                end
+            end
+            assign div_pick[ak] = div_elig[ak] && !(|beaten);
+        end
+    endgenerate
 
-    wire [31:0] alu_sel_op1_eff =
-        (alu_rs_q1_v[alu_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q1_t[alu_sel_slot])) ?
-        cdb_val : alu_rs_op1_val[alu_sel_slot];
-    wire [31:0] alu_sel_op2_eff =
-        (alu_rs_q2_v[alu_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q2_t[alu_sel_slot])) ?
-        cdb_val : alu_rs_op2_val[alu_sel_slot];
+    wire       div_sel_valid = div_active || (|div_elig);
+    wire [2:0] div_sel_slot  = div_active ? div_active_slot : (
+        div_pick[0] ? 3'd0 : div_pick[1] ? 3'd1 : div_pick[2] ? 3'd2 : div_pick[3] ? 3'd3 :
+        div_pick[4] ? 3'd4 : div_pick[5] ? 3'd5 : div_pick[6] ? 3'd6 : 3'd7);
 
-    wire [31:0] alu_op1 = alu_rs_op1_sel[alu_sel_slot] ? alu_rs_pc[alu_sel_slot]  : alu_sel_op1_eff;
-    wire [31:0] alu_op2 = alu_rs_op2_sel[alu_sel_slot] ? alu_rs_imm[alu_sel_slot] : alu_sel_op2_eff;
+    // 3 INT CDB Output Buffers -> Age-ordered Mux into cdb_arb_i's i_alu_* port
+    reg        alu0_cdb_v, alu1_cdb_v, div_cdb_v;
+    reg  [2:0] alu0_cdb_tag, alu1_cdb_tag, div_cdb_tag;
+    reg  [4:0] alu0_cdb_rd,  alu1_cdb_rd,  div_cdb_rd;
+    reg [31:0] alu0_cdb_val, alu1_cdb_val, div_cdb_val;
+    reg [31:0] alu0_cdb_pc,  alu1_cdb_pc,  div_cdb_pc;
 
-    wire        alu_sel_is_div = alu_sel_valid && alu_rs_mext[alu_sel_slot] && alu_rs_opsel[alu_sel_slot][2];
-    wire [31:0] alu_out_result;
-    wire        alu_out_eq, alu_out_slt, alu_out_busy;
+    wire [2:0] alu0_cdb_age = alu0_cdb_tag - rob_head;
+    wire [2:0] alu1_cdb_age = alu1_cdb_tag - rob_head;
+    wire [2:0] div_cdb_age  = div_cdb_tag  - rob_head;
 
-    wire        alu_disp_fire = alu_sel_valid && !alu_out_busy && alu_cdb_can_accept;
+    wire alu_mux_pick_0 = alu0_cdb_v &&
+                          (!alu1_cdb_v || (alu0_cdb_age <= alu1_cdb_age)) &&
+                          (!div_cdb_v  || (alu0_cdb_age <= div_cdb_age));
+    wire alu_mux_pick_1 = !alu_mux_pick_0 && alu1_cdb_v &&
+                          (!div_cdb_v  || (alu1_cdb_age <= div_cdb_age));
+    wire alu_mux_pick_div = !alu_mux_pick_0 && !alu_mux_pick_1 && div_cdb_v;
 
-    alu alu_i (
+    wire        alu_mux_v   = alu0_cdb_v | alu1_cdb_v | div_cdb_v;
+    wire [ 2:0] alu_mux_tag = alu_mux_pick_0 ? alu0_cdb_tag : alu_mux_pick_1 ? alu1_cdb_tag : div_cdb_tag;
+    wire [ 4:0] alu_mux_rd  = alu_mux_pick_0 ? alu0_cdb_rd  : alu_mux_pick_1 ? alu1_cdb_rd  : div_cdb_rd;
+    wire [31:0] alu_mux_val = alu_mux_pick_0 ? alu0_cdb_val : alu_mux_pick_1 ? alu1_cdb_val : div_cdb_val;
+    wire [31:0] alu_mux_pc  = alu_mux_pick_0 ? alu0_cdb_pc  : alu_mux_pick_1 ? alu1_cdb_pc  : div_cdb_pc;
+
+    wire alu0_cdb_gnt = o_alu_gnt && alu_mux_pick_0;
+    wire alu1_cdb_gnt = o_alu_gnt && alu_mux_pick_1;
+    wire div_cdb_gnt  = o_alu_gnt && alu_mux_pick_div;
+
+    wire alu0_cdb_can_accept = !alu0_cdb_v || alu0_cdb_gnt;
+    wire alu1_cdb_can_accept = !alu1_cdb_v || alu1_cdb_gnt;
+    wire div_cdb_can_accept  = !div_cdb_v  || div_cdb_gnt;
+
+    // Effective operands for ALU0, ALU1, DIV
+    wire [31:0] alu0_op1_eff = (alu_rs_q1_v[alu0_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q1_t[alu0_sel_slot])) ? cdb_val : alu_rs_op1_val[alu0_sel_slot];
+    wire [31:0] alu0_op2_eff = (alu_rs_q2_v[alu0_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q2_t[alu0_sel_slot])) ? cdb_val : alu_rs_op2_val[alu0_sel_slot];
+    wire [31:0] alu0_op1     = alu_rs_op1_sel[alu0_sel_slot] ? alu_rs_pc[alu0_sel_slot]  : alu0_op1_eff;
+    wire [31:0] alu0_op2     = alu_rs_op2_sel[alu0_sel_slot] ? alu_rs_imm[alu0_sel_slot] : alu0_op2_eff;
+
+    wire [31:0] alu1_op1_eff = (alu_rs_q1_v[alu1_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q1_t[alu1_sel_slot])) ? cdb_val : alu_rs_op1_val[alu1_sel_slot];
+    wire [31:0] alu1_op2_eff = (alu_rs_q2_v[alu1_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q2_t[alu1_sel_slot])) ? cdb_val : alu_rs_op2_val[alu1_sel_slot];
+    wire [31:0] alu1_op1     = alu_rs_op1_sel[alu1_sel_slot] ? alu_rs_pc[alu1_sel_slot]  : alu1_op1_eff;
+    wire [31:0] alu1_op2     = alu_rs_op2_sel[alu1_sel_slot] ? alu_rs_imm[alu1_sel_slot] : alu1_op2_eff;
+
+    wire [31:0] div_op1_eff  = (alu_rs_q1_v[div_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q1_t[div_sel_slot])) ? cdb_val : alu_rs_op1_val[div_sel_slot];
+    wire [31:0] div_op2_eff  = (alu_rs_q2_v[div_sel_slot] && cdb_valid && (cdb_tag == alu_rs_q2_t[div_sel_slot])) ? cdb_val : alu_rs_op2_val[div_sel_slot];
+
+    wire [31:0] alu0_out_result, alu1_out_result, div_out_result;
+    wire        alu0_out_eq, alu0_out_slt, alu0_out_busy;
+    wire        alu1_out_eq, alu1_out_slt, alu1_out_busy;
+    wire        div_out_eq,  div_out_slt,  div_out_busy;
+
+    wire alu0_disp_fire = alu0_sel_valid && !alu0_out_busy && alu0_cdb_can_accept;
+    wire alu1_disp_fire = alu1_sel_valid && !alu1_out_busy && alu1_cdb_can_accept;
+    wire div_disp_fire  = div_sel_valid  && !div_out_busy  && div_cdb_can_accept;
+
+    // Branch / Jump resolution on ALU0 + Misprediction Detection
+    wire [31:0] alu0_sel_pc       = alu_rs_pc[alu0_sel_slot];
+    wire [31:0] alu0_sel_imm      = alu_rs_imm[alu0_sel_slot];
+    wire [ 2:0] alu0_sel_tag      = alu_rs_tag[alu0_sel_slot];
+    wire [ 4:0] alu0_sel_rd       = alu_rs_rd[alu0_sel_slot];
+    wire        alu0_sel_branch   = alu_rs_branch[alu0_sel_slot];
+    wire        alu0_sel_jump     = alu_rs_jump[alu0_sel_slot];
+    wire [31:0] alu_br_target     = alu0_sel_pc + alu0_sel_imm;
+    wire [31:0] alu_jmp_target    = alu_rs_pc_sel[alu0_sel_slot] ? (alu0_out_result & ~32'd1) : alu_br_target;
+    wire        alu_br_comp       = alu_rs_br_eq[alu0_sel_slot] ? alu0_out_eq : alu0_out_slt;
+    wire        alu_br_taken      = alu0_sel_branch && (alu_br_comp ^ alu_rs_br_inv[alu0_sel_slot]);
+    wire        alu_redirect_raw  = alu0_sel_jump || alu_br_taken;
+    wire [31:0] alu_next_pc       = alu0_sel_jump ? alu_jmp_target :
+                                    alu_br_taken  ? alu_br_target :
+                                                    (alu0_sel_pc + 32'd4);
+    wire        alu_br_trap       = alu_redirect_raw && (alu_next_pc[1:0] != 2'b00);
+    wire        alu_resolve_fire  = alu0_disp_fire && (alu0_sel_branch || alu0_sel_jump);
+    wire [31:0] effective_next_pc = alu_br_trap ? (alu0_sel_pc + 32'd4) : alu_next_pc;
+
+    assign mispredict_fire = alu_resolve_fire && (effective_next_pc != rob_pred_pc[alu0_sel_tag]);
+    wire [ 2:0] misp_b_age = alu0_sel_tag - rob_head;
+
+    wire [31:0] alu0_cdb_calc_val =
+        alu0_sel_branch                 ? 32'd0 :
+        alu_rs_rd_sel[alu0_sel_slot][1] ? alu0_sel_imm :
+        alu_rs_rd_sel[alu0_sel_slot][2] ? (alu0_sel_pc + 32'd4) :
+                                          alu0_out_result;
+
+    wire [31:0] alu1_cdb_calc_val =
+        alu_rs_rd_sel[alu1_sel_slot][1] ? alu_rs_imm[alu1_sel_slot] :
+        alu_rs_rd_sel[alu1_sel_slot][2] ? (alu_rs_pc[alu1_sel_slot] + 32'd4) :
+                                          alu1_out_result;
+
+    wire div_slot_flushed = mispredict_fire && div_sel_valid && ((alu_rs_tag[div_sel_slot] - rob_head) > misp_b_age);
+
+    alu alu_0 (
         .i_clk      (i_clk),
         .i_rst      (i_rst),
-        .i_opsel    (alu_sel_valid ? alu_rs_opsel[alu_sel_slot]    : 3'b000),
-        .i_sub      (alu_sel_valid ? alu_rs_sub[alu_sel_slot]      : 1'b0),
-        .i_unsigned (alu_sel_valid ? alu_rs_unsigned[alu_sel_slot] : 1'b0),
-        .i_arith    (alu_sel_valid ? alu_rs_arith[alu_sel_slot]    : 1'b0),
-        .i_mext     (alu_sel_valid ? alu_rs_mext[alu_sel_slot]     : 1'b0),
-        .i_advance  (alu_disp_fire),
-        .i_op1      (alu_op1),
-        .i_op2      (alu_op2),
-        .o_result   (alu_out_result),
-        .o_eq       (alu_out_eq),
-        .o_slt      (alu_out_slt),
-        .o_busy     (alu_out_busy)
+        .i_opsel    (alu0_sel_valid ? alu_rs_opsel[alu0_sel_slot]    : 3'b000),
+        .i_sub      (alu0_sel_valid ? alu_rs_sub[alu0_sel_slot]      : 1'b0),
+        .i_unsigned (alu0_sel_valid ? alu_rs_unsigned[alu0_sel_slot] : 1'b0),
+        .i_arith    (alu0_sel_valid ? alu_rs_arith[alu0_sel_slot]    : 1'b0),
+        .i_mext     (alu0_sel_valid ? alu_rs_mext[alu0_sel_slot]     : 1'b0),
+        .i_advance  (alu0_disp_fire),
+        .i_op1      (alu0_op1),
+        .i_op2      (alu0_op2),
+        .o_result   (alu0_out_result),
+        .o_eq       (alu0_out_eq),
+        .o_slt      (alu0_out_slt),
+        .o_busy     (alu0_out_busy)
     );
 
-    // Branch / Jump resolution on ALU dispatch
-    wire [31:0] alu_sel_pc       = alu_rs_pc[alu_sel_slot];
-    wire [31:0] alu_sel_imm      = alu_rs_imm[alu_sel_slot];
-    wire [ 2:0] alu_sel_tag      = alu_rs_tag[alu_sel_slot];
-    wire [ 4:0] alu_sel_rd       = alu_rs_rd[alu_sel_slot];
-    wire        alu_sel_branch   = alu_rs_branch[alu_sel_slot];
-    wire        alu_sel_jump     = alu_rs_jump[alu_sel_slot];
-    wire [31:0] alu_br_target    = alu_sel_pc + alu_sel_imm;
-    wire [31:0] alu_jmp_target   = alu_rs_pc_sel[alu_sel_slot] ? (alu_out_result & ~32'd1) : alu_br_target;
-    wire        alu_br_comp      = alu_rs_br_eq[alu_sel_slot] ? alu_out_eq : alu_out_slt;
-    wire        alu_br_taken     = alu_sel_branch && (alu_br_comp ^ alu_rs_br_inv[alu_sel_slot]);
-    wire        alu_redirect_raw = alu_sel_jump || alu_br_taken;
-    wire [31:0] alu_next_pc      = alu_sel_jump ? alu_jmp_target :
-                                   alu_br_taken ? alu_br_target :
-                                                  (alu_sel_pc + 32'd4);
-    wire        alu_br_trap      = alu_redirect_raw && (alu_next_pc[1:0] != 2'b00);
-    wire        alu_resolve_fire = alu_disp_fire && (alu_sel_branch || alu_sel_jump);
-    wire        redirect_taken   = alu_resolve_fire && alu_redirect_raw && !alu_br_trap;
-    wire [31:0] redirect_pc      = alu_next_pc;
+    alu alu_1 (
+        .i_clk      (i_clk),
+        .i_rst      (i_rst),
+        .i_opsel    (alu1_sel_valid ? alu_rs_opsel[alu1_sel_slot]    : 3'b000),
+        .i_sub      (alu1_sel_valid ? alu_rs_sub[alu1_sel_slot]      : 1'b0),
+        .i_unsigned (alu1_sel_valid ? alu_rs_unsigned[alu1_sel_slot] : 1'b0),
+        .i_arith    (alu1_sel_valid ? alu_rs_arith[alu1_sel_slot]    : 1'b0),
+        .i_mext     (alu1_sel_valid ? alu_rs_mext[alu1_sel_slot]     : 1'b0),
+        .i_advance  (alu1_disp_fire),
+        .i_op1      (alu1_op1),
+        .i_op2      (alu1_op2),
+        .o_result   (alu1_out_result),
+        .o_eq       (alu1_out_eq),
+        .o_slt      (alu1_out_slt),
+        .o_busy     (alu1_out_busy)
+    );
 
-    wire [31:0] alu_cdb_calc_val =
-        alu_sel_branch               ? 32'd0 :
-        alu_rs_rd_sel[alu_sel_slot][1] ? alu_sel_imm :
-        alu_rs_rd_sel[alu_sel_slot][2] ? (alu_sel_pc + 32'd4) :
-                                         alu_out_result;
+    alu div_unit (
+        .i_clk      (i_clk),
+        .i_rst      (i_rst || div_slot_flushed),
+        .i_opsel    (div_sel_valid ? alu_rs_opsel[div_sel_slot] : 3'b000),
+        .i_sub      (1'b0),
+        .i_unsigned (1'b0),
+        .i_arith    (1'b0),
+        .i_mext     (div_sel_valid),
+        .i_advance  (div_disp_fire),
+        .i_op1      (div_op1_eff),
+        .i_op2      (div_op2_eff),
+        .o_result   (div_out_result),
+        .o_eq       (div_out_eq),
+        .o_slt      (div_out_slt),
+        .o_busy     (div_out_busy)
+    );
 
     // ========================================================================
-    // 7. FP Reservation Station (4 entries) + Dual FPUs (fpu_0, fpu_1)
+    // 7. FP Reservation Station (8 entries) + Dual FPUs (Direct arch_fcsr)
     // ========================================================================
     reg         fp_rs_valid      [0:FP_RS_SIZE-1];
     reg  [ 2:0] fp_rs_tag        [0:FP_RS_SIZE-1];
@@ -573,35 +755,38 @@ module hart #(
     reg         fp_rs_q3_v       [0:FP_RS_SIZE-1];
     reg  [ 2:0] fp_rs_q3_t       [0:FP_RS_SIZE-1];
 
-    assign fp_rs_full = fp_rs_valid[0] && fp_rs_valid[1] && fp_rs_valid[2] && fp_rs_valid[3];
+    assign fp_rs_full =
+        fp_rs_valid[0] && fp_rs_valid[1] && fp_rs_valid[2] && fp_rs_valid[3] &&
+        fp_rs_valid[4] && fp_rs_valid[5] && fp_rs_valid[6] && fp_rs_valid[7];
 
-    wire [1:0] fp_rs_free_idx =
-        !fp_rs_valid[0] ? 2'd0 :
-        !fp_rs_valid[1] ? 2'd1 :
-        !fp_rs_valid[2] ? 2'd2 :
-                          2'd3;
+    wire [2:0] fp_rs_free_idx =
+        !fp_rs_valid[0] ? 3'd0 :
+        !fp_rs_valid[1] ? 3'd1 :
+        !fp_rs_valid[2] ? 3'd2 :
+        !fp_rs_valid[3] ? 3'd3 :
+        !fp_rs_valid[4] ? 3'd4 :
+        !fp_rs_valid[5] ? 3'd5 :
+        !fp_rs_valid[6] ? 3'd6 : 3'd7;
 
     reg        fp0_busy_slot_v, fp1_busy_slot_v;
-    reg  [1:0] fp0_busy_slot,   fp1_busy_slot;
+    reg  [2:0] fp0_busy_slot,   fp1_busy_slot;
 
     reg        fp0_cdb_v, fp1_cdb_v;
     reg  [2:0] fp0_cdb_tag, fp1_cdb_tag;
     reg  [4:0] fp0_cdb_rd,  fp1_cdb_rd;
-    reg  [31:0] fp0_cdb_val, fp1_cdb_val;
-    reg  [31:0] fp0_cdb_pc,  fp1_cdb_pc;
+    reg [31:0] fp0_cdb_val, fp1_cdb_val;
+    reg [31:0] fp0_cdb_pc,  fp1_cdb_pc;
     reg  [4:0] fp0_cdb_fflags, fp1_cdb_fflags;
-
-    reg        fp0_needs_sync, fp1_needs_sync;
 
     wire fp0_cdb_can_accept = !fp0_cdb_v || o_fp0_gnt;
     wire fp1_cdb_can_accept = !fp1_cdb_v || o_fp1_gnt;
 
-    wire [3:0] fp_rs_ready;
-    wire [3:0] fp_rs_older_csr;
-    wire [2:0] fp_rs_age [0:3];
-    genvar fk, rj;
+    wire [7:0] fp_rs_ready;
+    wire [7:0] fp_rs_older_csr;
+    wire [2:0] fp_rs_age [0:7];
+    genvar fk, fj, rj;
     generate
-        for (fk = 0; fk < 4; fk = fk + 1) begin : gen_fp_rs_rdy
+        for (fk = 0; fk < 8; fk = fk + 1) begin : gen_fp_rs_rdy
             wire q1_rdy = !fp_rs_q1_v[fk] || (cdb_valid && (cdb_tag == fp_rs_q1_t[fk]));
             wire q2_rdy = !fp_rs_q2_v[fk] || (cdb_valid && (cdb_tag == fp_rs_q2_t[fk]));
             wire q3_rdy = !fp_rs_q3_v[fk] || (cdb_valid && (cdb_tag == fp_rs_q3_t[fk]));
@@ -613,74 +798,77 @@ module hart #(
             end
             assign fp_rs_age[fk]       = fp_rs_tag[fk] - rob_head;
             assign fp_rs_older_csr[fk] = |older_csr_vec;
-            assign fp_rs_ready[fk]     = fp_rs_valid[fk] && q1_rdy && q2_rdy && q3_rdy && !fp_rs_older_csr[fk];
+            assign fp_rs_ready[fk]     = fp_rs_valid[fk] && q1_rdy && q2_rdy && q3_rdy &&
+                                         (!(fp_rs_dyn_rm[fk] || fp_rs_is_csr[fk]) || !fp_rs_older_csr[fk]);
         end
     endgenerate
 
-    // CSR instructions serialize at ROB head when both FPUs and their CDB buffers are idle
-    wire csr_can_run = !fp0_busy_slot_v && !fp1_busy_slot_v &&
-                       !fp0_cdb_v && !fp1_cdb_v &&
-                       !fp0_needs_sync && !fp1_needs_sync;
-
-    wire [3:0] fp0_elig;
-    wire [3:0] fp1_elig;
+    wire [7:0] fp0_elig;
+    wire [7:0] fp1_elig;
     generate
-        for (fk = 0; fk < 4; fk = fk + 1) begin : gen_fp_elig
-            localparam [1:0] FK_IDX = fk;
+        for (fk = 0; fk < 8; fk = fk + 1) begin : gen_fp_elig
+            localparam [2:0] FK_IDX = fk;
             wire not_on_fp1 = !(fp1_busy_slot_v && (fp1_busy_slot == FK_IDX));
             wire not_on_fp0 = !(fp0_busy_slot_v && (fp0_busy_slot == FK_IDX));
-            wire csr_ok0    = !fp_rs_is_csr[fk] || ((fp_rs_tag[fk] == rob_head) && csr_can_run);
-            wire rm_ok0     = !fp_rs_dyn_rm[fk] || !fp0_needs_sync;
-            wire rm_ok1     = !fp_rs_dyn_rm[fk] || !fp1_needs_sync;
-            assign fp0_elig[fk] = fp_rs_ready[fk] && not_on_fp1 && csr_ok0 && rm_ok0;
-            assign fp1_elig[fk] = fp_rs_ready[fk] && not_on_fp0 && !fp_rs_is_csr[fk] && rm_ok1;
+            wire csr_ok0    = !fp_rs_is_csr[fk] || (fp_rs_tag[fk] == rob_head);
+            assign fp0_elig[fk] = fp_rs_ready[fk] && not_on_fp1 && csr_ok0;
+            assign fp1_elig[fk] = fp_rs_ready[fk] && not_on_fp0 && !fp_rs_is_csr[fk];
         end
     endgenerate
 
-    wire fp0_pick0 = fp0_elig[0] &&
-                     (!fp0_elig[1] || (fp_rs_age[0] <= fp_rs_age[1])) &&
-                     (!fp0_elig[2] || (fp_rs_age[0] <= fp_rs_age[2])) &&
-                     (!fp0_elig[3] || (fp_rs_age[0] <= fp_rs_age[3]));
-    wire fp0_pick1 = !fp0_pick0 && fp0_elig[1] &&
-                     (!fp0_elig[2] || (fp_rs_age[1] <= fp_rs_age[2])) &&
-                     (!fp0_elig[3] || (fp_rs_age[1] <= fp_rs_age[3]));
-    wire fp0_pick2 = !fp0_pick0 && !fp0_pick1 && fp0_elig[2] &&
-                     (!fp0_elig[3] || (fp_rs_age[2] <= fp_rs_age[3]));
-
-    wire       fp0_sync_now  = fp0_needs_sync && !fp0_busy_slot_v && !fp0_cdb_v;
-    wire       fp0_sel_valid = !fp0_sync_now && (fp0_busy_slot_v || (|fp0_elig));
-    wire [1:0] fp0_sel_slot  = fp0_busy_slot_v ? fp0_busy_slot :
-                               fp0_pick0 ? 2'd0 :
-                               fp0_pick1 ? 2'd1 :
-                               fp0_pick2 ? 2'd2 : 2'd3;
-
-    // FP1 excludes fp0_sel_slot when fp0_sel_valid is asserted
-    wire [3:0] fp1_elig_excl;
+    wire [7:0] fp0_pick;
     generate
-        for (fk = 0; fk < 4; fk = fk + 1) begin : gen_fp1_excl
-            localparam [1:0] FK_IDX = fk;
+        for (fk = 0; fk < 8; fk = fk + 1) begin : gen_fp0_pick
+            wire [7:0] beaten;
+            for (fj = 0; fj < 8; fj = fj + 1) begin : gen_fp0_cmp
+                if (fj == fk) begin : gen_s
+                    assign beaten[fj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] FJ_I = fj;
+                    localparam [2:0] FK_I = fk;
+                    assign beaten[fj] = fp0_elig[fj] &&
+                        ((fp_rs_age[fj] < fp_rs_age[fk]) ||
+                         ((fp_rs_age[fj] == fp_rs_age[fk]) && (FJ_I < FK_I)));
+                end
+            end
+            assign fp0_pick[fk] = fp0_elig[fk] && !(|beaten);
+        end
+    endgenerate
+
+    wire       fp0_sel_valid = fp0_busy_slot_v || (|fp0_elig);
+    wire [2:0] fp0_sel_slot  = fp0_busy_slot_v ? fp0_busy_slot : (
+        fp0_pick[0] ? 3'd0 : fp0_pick[1] ? 3'd1 : fp0_pick[2] ? 3'd2 : fp0_pick[3] ? 3'd3 :
+        fp0_pick[4] ? 3'd4 : fp0_pick[5] ? 3'd5 : fp0_pick[6] ? 3'd6 : 3'd7);
+
+    wire [7:0] fp1_elig_excl;
+    wire [7:0] fp1_pick;
+    generate
+        for (fk = 0; fk < 8; fk = fk + 1) begin : gen_fp1_excl
+            localparam [2:0] FK_IDX = fk;
             assign fp1_elig_excl[fk] = fp1_elig[fk] && !(fp0_sel_valid && (fp0_sel_slot == FK_IDX));
         end
+        for (fk = 0; fk < 8; fk = fk + 1) begin : gen_fp1_pick
+            wire [7:0] beaten;
+            for (fj = 0; fj < 8; fj = fj + 1) begin : gen_fp1_cmp
+                if (fj == fk) begin : gen_s
+                    assign beaten[fj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] FJ_I = fj;
+                    localparam [2:0] FK_I = fk;
+                    assign beaten[fj] = fp1_elig_excl[fj] &&
+                        ((fp_rs_age[fj] < fp_rs_age[fk]) ||
+                         ((fp_rs_age[fj] == fp_rs_age[fk]) && (FJ_I < FK_I)));
+                end
+            end
+            assign fp1_pick[fk] = fp1_elig_excl[fk] && !(|beaten);
+        end
     endgenerate
 
-    wire fp1_pick0 = fp1_elig_excl[0] &&
-                     (!fp1_elig_excl[1] || (fp_rs_age[0] <= fp_rs_age[1])) &&
-                     (!fp1_elig_excl[2] || (fp_rs_age[0] <= fp_rs_age[2])) &&
-                     (!fp1_elig_excl[3] || (fp_rs_age[0] <= fp_rs_age[3]));
-    wire fp1_pick1 = !fp1_pick0 && fp1_elig_excl[1] &&
-                     (!fp1_elig_excl[2] || (fp_rs_age[1] <= fp_rs_age[2])) &&
-                     (!fp1_elig_excl[3] || (fp_rs_age[1] <= fp_rs_age[3]));
-    wire fp1_pick2 = !fp1_pick0 && !fp1_pick1 && fp1_elig_excl[2] &&
-                     (!fp1_elig_excl[3] || (fp_rs_age[2] <= fp_rs_age[3]));
+    wire       fp1_sel_valid = fp1_busy_slot_v || (|fp1_elig_excl);
+    wire [2:0] fp1_sel_slot  = fp1_busy_slot_v ? fp1_busy_slot : (
+        fp1_pick[0] ? 3'd0 : fp1_pick[1] ? 3'd1 : fp1_pick[2] ? 3'd2 : fp1_pick[3] ? 3'd3 :
+        fp1_pick[4] ? 3'd4 : fp1_pick[5] ? 3'd5 : fp1_pick[6] ? 3'd6 : 3'd7);
 
-    wire       fp1_sync_now  = fp1_needs_sync && !fp1_busy_slot_v && !fp1_cdb_v;
-    wire       fp1_sel_valid = !fp1_sync_now && (fp1_busy_slot_v || (|fp1_elig_excl));
-    wire [1:0] fp1_sel_slot  = fp1_busy_slot_v ? fp1_busy_slot :
-                               fp1_pick0 ? 2'd0 :
-                               fp1_pick1 ? 2'd1 :
-                               fp1_pick2 ? 2'd2 : 2'd3;
-
-    // Effective operands for FP0 and FP1 (with CDB bypass)
     wire [31:0] fp0_op1_eff = (fp_rs_q1_v[fp0_sel_slot] && cdb_valid && (cdb_tag == fp_rs_q1_t[fp0_sel_slot])) ? cdb_val : fp_rs_op1_val[fp0_sel_slot];
     wire [31:0] fp0_op2_eff = (fp_rs_q2_v[fp0_sel_slot] && cdb_valid && (cdb_tag == fp_rs_q2_t[fp0_sel_slot])) ? cdb_val : fp_rs_op2_val[fp0_sel_slot];
     wire [31:0] fp0_op3_eff = (fp_rs_q3_v[fp0_sel_slot] && cdb_valid && (cdb_tag == fp_rs_q3_t[fp0_sel_slot])) ? cdb_val : fp_rs_op3_val[fp0_sel_slot];
@@ -697,120 +885,211 @@ module hart #(
     wire fp0_disp_fire = fp0_sel_valid && !fp0_busy && fp0_cdb_can_accept;
     wire fp1_disp_fire = fp1_sel_valid && !fp1_busy && fp1_cdb_can_accept;
 
-    // 32'h00309073 = csrrw x0, fcsr, x1 (syncs internal fpu fcsr to arch_fcsr in 1 cycle)
+    wire fp0_slot_flushed = mispredict_fire && fp0_sel_valid && ((fp_rs_tag[fp0_sel_slot] - rob_head) > misp_b_age);
+    wire fp1_slot_flushed = mispredict_fire && fp1_sel_valid && ((fp_rs_tag[fp1_sel_slot] - rob_head) > misp_b_age);
+
     fpu fpu_0 (
         .i_clk        (i_clk),
-        .i_rst        (i_rst),
-        .i_inst       (fp0_sync_now ? 32'h00309073 : fp_rs_inst[fp0_sel_slot]),
-        .i_valid      (fp0_sync_now || fp0_sel_valid),
-        .i_advance    (fp0_sync_now || fp0_disp_fire),
+        .i_rst        (i_rst || fp0_slot_flushed),
+        .i_inst       (fp_rs_inst[fp0_sel_slot]),
+        .i_valid      (fp0_sel_valid),
+        .i_advance    (fp0_disp_fire),
         .i_frs1       (fp0_op1_eff),
         .i_frs2       (fp0_op2_eff),
         .i_frs3       (fp0_op3_eff),
-        .i_xrs1       (fp0_sync_now ? {24'd0, arch_fcsr} : fp0_op1_eff),
+        .i_xrs1       (fp0_op1_eff),
         .o_fp_result  (fp0_fp_res),
         .o_int_result (fp0_int_res),
         .o_fflags     (fp0_fflags),
         .o_busy       (fp0_busy),
-        .o_rm_trap    (fp0_rm_trap)
+        .o_rm_trap    (fp0_rm_trap),
+        .i_arch_fcsr  (arch_fcsr)
     );
 
     fpu fpu_1 (
         .i_clk        (i_clk),
-        .i_rst        (i_rst),
-        .i_inst       (fp1_sync_now ? 32'h00309073 : fp_rs_inst[fp1_sel_slot]),
-        .i_valid      (fp1_sync_now || fp1_sel_valid),
-        .i_advance    (fp1_sync_now || fp1_disp_fire),
+        .i_rst        (i_rst || fp1_slot_flushed),
+        .i_inst       (fp_rs_inst[fp1_sel_slot]),
+        .i_valid      (fp1_sel_valid),
+        .i_advance    (fp1_disp_fire),
         .i_frs1       (fp1_op1_eff),
         .i_frs2       (fp1_op2_eff),
         .i_frs3       (fp1_op3_eff),
-        .i_xrs1       (fp1_sync_now ? {24'd0, arch_fcsr} : fp1_op1_eff),
+        .i_xrs1       (fp1_op1_eff),
         .o_fp_result  (fp1_fp_res),
         .o_int_result (fp1_int_res),
         .o_fflags     (fp1_fflags),
         .o_busy       (fp1_busy),
-        .o_rm_trap    (fp1_rm_trap)
+        .o_rm_trap    (fp1_rm_trap),
+        .i_arch_fcsr  (arch_fcsr)
     );
 
     wire [31:0] fp0_res_val = fp_rs_frd_en[fp0_sel_slot] ? fp0_fp_res : fp0_int_res;
     wire [31:0] fp1_res_val = fp_rs_frd_en[fp1_sel_slot] ? fp1_fp_res : fp1_int_res;
 
     // ========================================================================
-    // 8. In-Order Load-Store Unit (8 entries) + Phase 5 Data Cache
+    // 8. Out-of-Order Non-Blocking Load-Store Unit (8 entries) + Non-Blocking Cache
     // ========================================================================
     reg  [ 2:0] lsu_head, lsu_tail;
     reg  [ 3:0] lsu_count;
 
-    reg         lsu_valid   [0:LSU_SIZE-1];
-    reg  [ 2:0] lsu_tag     [0:LSU_SIZE-1];
-    reg  [31:0] lsu_pc      [0:LSU_SIZE-1];
-    reg  [ 4:0] lsu_rd      [0:LSU_SIZE-1];
-    reg         lsu_is_load [0:LSU_SIZE-1];
-    reg  [31:0] lsu_imm     [0:LSU_SIZE-1];
-    reg         lsu_memb    [0:LSU_SIZE-1];
-    reg         lsu_memh    [0:LSU_SIZE-1];
-    reg         lsu_memw    [0:LSU_SIZE-1];
-    reg         lsu_memu    [0:LSU_SIZE-1];
-    reg  [31:0] lsu_op1_val [0:LSU_SIZE-1];
-    reg         lsu_q1_v    [0:LSU_SIZE-1];
-    reg  [ 2:0] lsu_q1_t    [0:LSU_SIZE-1];
-    reg  [31:0] lsu_op2_val [0:LSU_SIZE-1];
-    reg         lsu_q2_v    [0:LSU_SIZE-1];
-    reg  [ 2:0] lsu_q2_t    [0:LSU_SIZE-1];
-    reg         lsu_st_prep [0:LSU_SIZE-1];
+    reg         lsu_valid       [0:LSU_SIZE-1];
+    reg  [ 2:0] lsu_tag         [0:LSU_SIZE-1];
+    reg  [31:0] lsu_pc          [0:LSU_SIZE-1];
+    reg  [ 4:0] lsu_rd          [0:LSU_SIZE-1];
+    reg         lsu_is_load     [0:LSU_SIZE-1];
+    reg  [31:0] lsu_imm         [0:LSU_SIZE-1];
+    reg         lsu_memb        [0:LSU_SIZE-1];
+    reg         lsu_memh        [0:LSU_SIZE-1];
+    reg         lsu_memw        [0:LSU_SIZE-1];
+    reg         lsu_memu        [0:LSU_SIZE-1];
+    reg  [31:0] lsu_op1_val     [0:LSU_SIZE-1];
+    reg         lsu_q1_v        [0:LSU_SIZE-1];
+    reg  [ 2:0] lsu_q1_t        [0:LSU_SIZE-1];
+    reg  [31:0] lsu_op2_val     [0:LSU_SIZE-1];
+    reg         lsu_q2_v        [0:LSU_SIZE-1];
+    reg  [ 2:0] lsu_q2_t        [0:LSU_SIZE-1];
+    reg         lsu_st_prepped  [0:LSU_SIZE-1];
+    reg  [31:0] lsu_st_baddr    [0:LSU_SIZE-1];
+    reg  [ 3:0] lsu_st_mask     [0:LSU_SIZE-1];
+    reg  [31:0] lsu_st_wdata    [0:LSU_SIZE-1];
 
-    // Store commit latch (captured when store becomes ready in LSU)
-    reg  [31:0] lsu_st_byte_addr;
-    reg  [ 3:0] lsu_st_mask;
-    reg  [31:0] lsu_st_wdata;
-
-    // Load CDB buffer (if dcache_ready asserted while load lost CDB arbitration)
-    reg         ld_buf_valid;
-    reg  [31:0] ld_buf_val;
-    reg  [31:0] ld_buf_raw_rdata;
-    reg  [31:0] ld_buf_word_addr;
-    reg  [ 3:0] ld_buf_mask;
+    reg  [ 1:0] lsu_ld_state    [0:LSU_SIZE-1];
+    reg  [31:0] lsu_ld_val      [0:LSU_SIZE-1];
+    reg  [31:0] lsu_ld_raw      [0:LSU_SIZE-1];
+    reg  [31:0] lsu_ld_waddr    [0:LSU_SIZE-1];
+    reg  [ 3:0] lsu_ld_mask     [0:LSU_SIZE-1];
+    reg  [31:0] lsu_ld_blk_addr [0:LSU_SIZE-1];
+    reg  [ 1:0] lsu_ld_byte_off [0:LSU_SIZE-1];
 
     assign lsu_full = (lsu_count == 4'd8);
 
-    wire [31:0] lsu_eff_addr   = lsu_op1_val[lsu_head] + lsu_imm[lsu_head];
-    wire [ 1:0] lsu_byte_off   = lsu_eff_addr[1:0];
-    wire        lsu_misaligned = (lsu_memh[lsu_head] && lsu_byte_off[0]) ||
-                                 (lsu_memw[lsu_head] && (lsu_byte_off != 2'b00));
+    wire [31:0] lsu_eff_addr   [0:LSU_SIZE-1];
+    wire [31:0] lsu_waddr_c    [0:LSU_SIZE-1];
+    wire [31:0] lsu_blk_addr_c [0:LSU_SIZE-1];
+    wire [ 1:0] lsu_boff_c     [0:LSU_SIZE-1];
+    wire        lsu_misal_c    [0:LSU_SIZE-1];
+    wire [ 3:0] lsu_mask_c     [0:LSU_SIZE-1];
+    wire [31:0] lsu_wdata_c    [0:LSU_SIZE-1];
+    wire [ 7:0] lsu_st_prep_fire;
+    wire [ 7:0] lsu_ld_trap_fire;
+    wire [ 7:0] lsu_ld_fwd_fire;
+    wire [31:0] lsu_ld_fwd_raw [0:LSU_SIZE-1];
+    wire [ 7:0] lsu_ld_dcache_elig;
+    wire [ 2:0] lsu_age        [0:LSU_SIZE-1];
 
-    wire [ 3:0] lsu_mask =
-        lsu_memw[lsu_head] ? 4'b1111 :
-        lsu_memh[lsu_head] ? (lsu_byte_off[1] ? 4'b1100 : 4'b0011) :
-        lsu_memb[lsu_head] ? (
-            (lsu_byte_off == 2'b00) ? 4'b0001 :
-            (lsu_byte_off == 2'b01) ? 4'b0010 :
-            (lsu_byte_off == 2'b10) ? 4'b0100 : 4'b1000
-        ) : 4'b0000;
+    genvar ls, pj, pk;
+    generate
+        for (ls = 0; ls < 8; ls = ls + 1) begin : gen_lsu_comb
+            localparam [2:0] LS_I = ls;
+            assign lsu_age[ls]        = LS_I - lsu_head;
+            assign lsu_eff_addr[ls]   = lsu_op1_val[ls] + lsu_imm[ls];
+            assign lsu_waddr_c[ls]    = {lsu_eff_addr[ls][31:2], 2'b00};
+            assign lsu_blk_addr_c[ls] = {lsu_eff_addr[ls][31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+            assign lsu_boff_c[ls]     = lsu_eff_addr[ls][1:0];
+            assign lsu_misal_c[ls]    = (lsu_memh[ls] && lsu_boff_c[ls][0]) ||
+                                        (lsu_memw[ls] && (lsu_boff_c[ls] != 2'b00));
+            assign lsu_mask_c[ls] =
+                lsu_memw[ls] ? 4'b1111 :
+                lsu_memh[ls] ? (lsu_boff_c[ls][1] ? 4'b1100 : 4'b0011) :
+                lsu_memb[ls] ? (
+                    (lsu_boff_c[ls] == 2'b00) ? 4'b0001 :
+                    (lsu_boff_c[ls] == 2'b01) ? 4'b0010 :
+                    (lsu_boff_c[ls] == 2'b10) ? 4'b0100 : 4'b1000
+                ) : 4'b0000;
+            assign lsu_wdata_c[ls] =
+                lsu_memw[ls] ? lsu_op2_val[ls] :
+                lsu_memh[ls] ? (lsu_boff_c[ls][1] ? {lsu_op2_val[ls][15:0], 16'b0} : {16'b0, lsu_op2_val[ls][15:0]}) :
+                lsu_memb[ls] ? (
+                    (lsu_boff_c[ls] == 2'b00) ? {24'b0, lsu_op2_val[ls][7:0]} :
+                    (lsu_boff_c[ls] == 2'b01) ? {16'b0, lsu_op2_val[ls][7:0], 8'b0} :
+                    (lsu_boff_c[ls] == 2'b10) ? {8'b0, lsu_op2_val[ls][7:0], 16'b0} :
+                                                {lsu_op2_val[ls][7:0], 24'b0}
+                ) : lsu_op2_val[ls];
 
-    wire [31:0] lsu_st_data_raw = lsu_op2_val[lsu_head];
-    wire [31:0] lsu_wdata_shifted =
-        lsu_memw[lsu_head] ? lsu_st_data_raw :
-        lsu_memh[lsu_head] ? (lsu_byte_off[1] ? {lsu_st_data_raw[15:0], 16'b0} : {16'b0, lsu_st_data_raw[15:0]}) :
-        lsu_memb[lsu_head] ? (
-            (lsu_byte_off == 2'b00) ? {24'b0, lsu_st_data_raw[7:0]} :
-            (lsu_byte_off == 2'b01) ? {16'b0, lsu_st_data_raw[7:0], 8'b0} :
-            (lsu_byte_off == 2'b10) ? {8'b0, lsu_st_data_raw[7:0], 16'b0} :
-                                      {lsu_st_data_raw[7:0], 24'b0}
-        ) : lsu_st_data_raw;
+            assign lsu_st_prep_fire[ls] = lsu_valid[ls] && !lsu_is_load[ls] &&
+                                          !lsu_st_prepped[ls] && !lsu_q1_v[ls] && !lsu_q2_v[ls];
 
-    wire lsu_ld_ready = lsu_valid[lsu_head] && lsu_is_load[lsu_head] && !lsu_q1_v[lsu_head];
-    wire lsu_ld_trap_fire = lsu_ld_ready && lsu_misaligned && !ld_buf_valid;
+            wire ld_base_rdy = lsu_valid[ls] && lsu_is_load[ls] &&
+                               (lsu_ld_state[ls] == LD_WAIT) && !lsu_q1_v[ls];
+            assign lsu_ld_trap_fire[ls] = ld_base_rdy && lsu_misal_c[ls];
 
-    wire lsu_st_prep_fire = lsu_valid[lsu_head] && !lsu_is_load[lsu_head] &&
-                            !lsu_q1_v[lsu_head] && !lsu_q2_v[lsu_head] && !lsu_st_prep[lsu_head];
+            wire [7:0] older_st_addr_unk;
+            wire [7:0] older_st_match;
+            wire [7:0] older_st_ym;
+            for (pj = 0; pj < 8; pj = pj + 1) begin : gen_older_st
+                wire is_older_st = lsu_valid[pj] && !lsu_is_load[pj] && (lsu_age[pj] < lsu_age[ls]);
+                assign older_st_addr_unk[pj] = is_older_st && lsu_q1_v[pj];
+                assign older_st_match[pj]    = is_older_st && !lsu_q1_v[pj] && !lsu_misal_c[pj] &&
+                                               (lsu_waddr_c[pj] == lsu_waddr_c[ls]);
+            end
 
-    // Cache arbitration: committing store at ROB head always has priority over load request
-    wire        dcache_wen   = rob_commit_store_req;
-    wire        dcache_ren   = !rob_commit_store_req && !ld_buf_valid && lsu_ld_ready && !lsu_misaligned;
-    wire [31:0] dcache_addr  = rob_commit_store_req ? lsu_st_byte_addr : lsu_eff_addr;
-    wire [ 3:0] dcache_mask  = rob_commit_store_req ? lsu_st_mask      : lsu_mask;
-    wire [31:0] dcache_wdata = lsu_st_wdata;
-    wire [31:0] dcache_rdata;
+            for (pj = 0; pj < 8; pj = pj + 1) begin : gen_ym_st
+                wire [7:0] younger_match;
+                for (pk = 0; pk < 8; pk = pk + 1) begin : gen_ym_cmp
+                    if (pk == pj) begin : gen_s
+                        assign younger_match[pk] = 1'b0;
+                    end else begin : gen_o
+                        assign younger_match[pk] = older_st_match[pk] && (lsu_age[pk] > lsu_age[pj]);
+                    end
+                end
+                assign older_st_ym[pj] = older_st_match[pj] && !(|younger_match);
+            end
+
+            wire any_older_st_unk   = |older_st_addr_unk;
+            wire any_older_st_match = |older_st_match;
+
+            wire [2:0] ym_slot =
+                older_st_ym[0] ? 3'd0 : older_st_ym[1] ? 3'd1 : older_st_ym[2] ? 3'd2 : older_st_ym[3] ? 3'd3 :
+                older_st_ym[4] ? 3'd4 : older_st_ym[5] ? 3'd5 : older_st_ym[6] ? 3'd6 : 3'd7;
+
+            wire ym_data_rdy  = !lsu_q2_v[ym_slot];
+            wire ym_full_cov  = ((lsu_mask_c[ym_slot] & lsu_mask_c[ls]) == lsu_mask_c[ls]) &&
+                                ((lsu_mask_c[ym_slot] == 4'b1111) || (lsu_mask_c[ym_slot] == lsu_mask_c[ls]));
+
+            wire can_fwd_now  = ld_base_rdy && !lsu_misal_c[ls] && !any_older_st_unk &&
+                                any_older_st_match && ym_data_rdy && ym_full_cov;
+            wire blocked_by_st = any_older_st_unk || (any_older_st_match && !(ym_data_rdy && ym_full_cov));
+
+            assign lsu_ld_fwd_fire[ls]    = can_fwd_now;
+            assign lsu_ld_fwd_raw[ls]     = lsu_wdata_c[ym_slot];
+            assign lsu_ld_dcache_elig[ls] = ld_base_rdy && !lsu_misal_c[ls] && !blocked_by_st && !any_older_st_match;
+        end
+    endgenerate
+
+    wire [7:0] ld_dcache_pick;
+    generate
+        for (ls = 0; ls < 8; ls = ls + 1) begin : gen_ld_dc_pick
+            wire [7:0] beaten;
+            for (pj = 0; pj < 8; pj = pj + 1) begin : gen_ld_dc_cmp
+                if (pj == ls) begin : gen_s
+                    assign beaten[pj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] PJ_I = pj;
+                    localparam [2:0] LS_I = ls;
+                    assign beaten[pj] = lsu_ld_dcache_elig[pj] &&
+                        ((lsu_age[pj] < lsu_age[ls]) || ((lsu_age[pj] == lsu_age[ls]) && (PJ_I < LS_I)));
+                end
+            end
+            assign ld_dcache_pick[ls] = lsu_ld_dcache_elig[ls] && !(|beaten);
+        end
+    endgenerate
+
+    wire       ld_dcache_pick_valid = |lsu_ld_dcache_elig;
+    wire [2:0] ld_dcache_pick_slot  =
+        ld_dcache_pick[0] ? 3'd0 : ld_dcache_pick[1] ? 3'd1 : ld_dcache_pick[2] ? 3'd2 : ld_dcache_pick[3] ? 3'd3 :
+        ld_dcache_pick[4] ? 3'd4 : ld_dcache_pick[5] ? 3'd5 : ld_dcache_pick[6] ? 3'd6 : 3'd7;
+
+    wire                    dcache_wen           = rob_commit_store_req;
+    wire                    dcache_ren           = !rob_commit_store_req && ld_dcache_pick_valid;
+    wire [31:0]             dcache_addr          = rob_commit_store_req ? lsu_st_baddr[lsu_head] : lsu_eff_addr[ld_dcache_pick_slot];
+    wire [ 3:0]             dcache_mask          = rob_commit_store_req ? lsu_st_mask[lsu_head]  : lsu_mask_c[ld_dcache_pick_slot];
+    wire [31:0]             dcache_wdata         = lsu_st_wdata[lsu_head];
+    wire [31:0]             dcache_rdata;
+    wire                    dcache_miss_accepted;
+    wire                    dcache_fill_valid;
+    wire [31:0]             dcache_fill_addr;
+    wire [BLOCK_SIZE*8-1:0] dcache_fill_data;
 
     cache #(
         .EVICT_POLICY (EVICT_POLICY),
@@ -819,56 +1098,123 @@ module hart #(
         .BLOCK_SIZE   (BLOCK_SIZE),
         .PREFETCH_EN  (PREFETCH_EN)
     ) dcache_i (
-        .i_clk         (i_clk),
-        .i_rst         (i_rst),
-        .i_ren         (dcache_ren),
-        .i_wen         (dcache_wen),
-        .i_addr        (dcache_addr),
-        .i_mask        (dcache_mask),
-        .i_wdata       (dcache_wdata),
-        .o_ready       (dcache_ready),
-        .o_rdata       (dcache_rdata),
-        .o_mem_rd      (o_mem_rd),
-        .o_mem_rd_addr (o_mem_rd_addr),
-        .i_mem_valid   (i_mem_valid),
-        .i_mem_rd_data (i_mem_rd_data),
-        .o_mem_wr      (o_mem_wr),
-        .o_mem_wr_addr (o_mem_wr_addr),
-        .o_mem_wr_data (o_mem_wr_data),
-        .o_mem_wr_be   (o_mem_wr_be)
+        .i_clk           (i_clk),
+        .i_rst           (i_rst),
+        .i_ren           (dcache_ren),
+        .i_wen           (dcache_wen),
+        .i_addr          (dcache_addr),
+        .i_mask          (dcache_mask),
+        .i_wdata         (dcache_wdata),
+        .o_ready         (dcache_ready),
+        .o_rdata         (dcache_rdata),
+        .o_miss_accepted (dcache_miss_accepted),
+        .o_fill_valid    (dcache_fill_valid),
+        .o_fill_addr     (dcache_fill_addr),
+        .o_fill_data     (dcache_fill_data),
+        .o_mem_rd        (o_mem_rd),
+        .o_mem_rd_addr   (o_mem_rd_addr),
+        .i_mem_ready     (i_mem_ready),
+        .i_mem_valid     (i_mem_valid),
+        .i_mem_rd_data   (i_mem_rd_data),
+        .o_mem_wr        (o_mem_wr),
+        .o_mem_wr_addr   (o_mem_wr_addr),
+        .o_mem_wr_data   (o_mem_wr_data),
+        .o_mem_wr_be     (o_mem_wr_be)
     );
 
-    wire [ 7:0] raw_byte = (lsu_byte_off == 2'b00) ? dcache_rdata[ 7: 0] :
-                           (lsu_byte_off == 2'b01) ? dcache_rdata[15: 8] :
-                           (lsu_byte_off == 2'b10) ? dcache_rdata[23:16] :
-                                                     dcache_rdata[31:24];
-    wire [15:0] raw_half = lsu_byte_off[1] ? dcache_rdata[31:16] : dcache_rdata[15:0];
-    wire [31:0] lsu_load_ext =
-        lsu_memw[lsu_head] ? dcache_rdata :
-        lsu_memh[lsu_head] ? (lsu_memu[lsu_head] ? {16'b0, raw_half} : {{16{raw_half[15]}}, raw_half}) :
-        lsu_memb[lsu_head] ? (lsu_memu[lsu_head] ? {24'b0, raw_byte} : {{24{raw_byte[7]}}, raw_byte}) :
-                             32'd0;
+    wire dcache_hit_fire  = dcache_ren && dcache_ready;
+    wire dcache_miss_fire = dcache_ren && !dcache_ready && dcache_miss_accepted;
 
-    wire        ld_cdb_req       = ld_buf_valid || (dcache_ren && dcache_ready);
-    wire [31:0] ld_cdb_req_val   = ld_buf_valid ? ld_buf_val       : lsu_load_ext;
-    wire [31:0] ld_cdb_req_raw   = ld_buf_valid ? ld_buf_raw_rdata : dcache_rdata;
-    wire [31:0] ld_cdb_req_waddr = ld_buf_valid ? ld_buf_word_addr : {lsu_eff_addr[31:2], 2'b00};
-    wire [ 3:0] ld_cdb_req_mask  = ld_buf_valid ? ld_buf_mask      : lsu_mask;
+    wire [1:0] dc_hit_boff = lsu_boff_c[ld_dcache_pick_slot];
+    wire [7:0] dc_hit_byte =
+        (dc_hit_boff == 2'b00) ? dcache_rdata[ 7: 0] :
+        (dc_hit_boff == 2'b01) ? dcache_rdata[15: 8] :
+        (dc_hit_boff == 2'b10) ? dcache_rdata[23:16] : dcache_rdata[31:24];
+    wire [15:0] dc_hit_half = dc_hit_boff[1] ? dcache_rdata[31:16] : dcache_rdata[15:0];
+    wire [31:0] dc_hit_ext  =
+        lsu_memw[ld_dcache_pick_slot] ? dcache_rdata :
+        lsu_memh[ld_dcache_pick_slot] ? (lsu_memu[ld_dcache_pick_slot] ? {16'b0, dc_hit_half} : {{16{dc_hit_half[15]}}, dc_hit_half}) :
+        lsu_memb[ld_dcache_pick_slot] ? (lsu_memu[ld_dcache_pick_slot] ? {24'b0, dc_hit_byte} : {{24{dc_hit_byte[7]}}, dc_hit_byte}) :
+                                        32'd0;
+
+    wire [31:0] lsu_ld_fwd_ext  [0:LSU_SIZE-1];
+    wire [31:0] lsu_ld_fill_raw [0:LSU_SIZE-1];
+    wire [31:0] lsu_ld_fill_ext [0:LSU_SIZE-1];
+    generate
+        for (ls = 0; ls < 8; ls = ls + 1) begin : gen_lsu_ext
+            wire [31:0] fw_r = lsu_ld_fwd_raw[ls];
+            wire [ 7:0] fw_b =
+                (lsu_boff_c[ls] == 2'b00) ? fw_r[ 7: 0] :
+                (lsu_boff_c[ls] == 2'b01) ? fw_r[15: 8] :
+                (lsu_boff_c[ls] == 2'b10) ? fw_r[23:16] : fw_r[31:24];
+            wire [15:0] fw_h = lsu_boff_c[ls][1] ? fw_r[31:16] : fw_r[15:0];
+            assign lsu_ld_fwd_ext[ls] =
+                lsu_memw[ls] ? fw_r :
+                lsu_memh[ls] ? (lsu_memu[ls] ? {16'b0, fw_h} : {{16{fw_h[15]}}, fw_h}) :
+                lsu_memb[ls] ? (lsu_memu[ls] ? {24'b0, fw_b} : {{24{fw_b[7]}}, fw_b}) : 32'd0;
+
+            wire [WORD_BITS-1:0] fill_widx = (OFFSET_BITS > 2) ? lsu_ld_waddr[ls][OFFSET_BITS-1:2] : {WORD_BITS{1'b0}};
+            wire [OFFSET_BITS+3-1:0] fill_bidx = {fill_widx, 5'b00000};
+            wire [31:0] fl_r = dcache_fill_data[fill_bidx +: 32];
+            wire [ 7:0] fl_b =
+                (lsu_ld_byte_off[ls] == 2'b00) ? fl_r[ 7: 0] :
+                (lsu_ld_byte_off[ls] == 2'b01) ? fl_r[15: 8] :
+                (lsu_ld_byte_off[ls] == 2'b10) ? fl_r[23:16] : fl_r[31:24];
+            wire [15:0] fl_h = lsu_ld_byte_off[ls][1] ? fl_r[31:16] : fl_r[15:0];
+            assign lsu_ld_fill_raw[ls] = fl_r;
+            assign lsu_ld_fill_ext[ls] =
+                lsu_memw[ls] ? fl_r :
+                lsu_memh[ls] ? (lsu_memu[ls] ? {16'b0, fl_h} : {{16{fl_h[15]}}, fl_h}) :
+                lsu_memb[ls] ? (lsu_memu[ls] ? {24'b0, fl_b} : {{24{fl_b[7]}}, fl_b}) : 32'd0;
+        end
+    endgenerate
+
+    wire [7:0] ld_cdb_elig;
+    wire [7:0] ld_cdb_pick;
+    generate
+        for (ls = 0; ls < 8; ls = ls + 1) begin : gen_ld_cdb_elig
+            assign ld_cdb_elig[ls] = lsu_valid[ls] && lsu_is_load[ls] && (lsu_ld_state[ls] == LD_CDB);
+        end
+        for (ls = 0; ls < 8; ls = ls + 1) begin : gen_ld_cdb_pick
+            wire [7:0] beaten;
+            for (pj = 0; pj < 8; pj = pj + 1) begin : gen_ld_cdb_cmp
+                if (pj == ls) begin : gen_s
+                    assign beaten[pj] = 1'b0;
+                end else begin : gen_o
+                    localparam [2:0] PJ_I = pj;
+                    localparam [2:0] LS_I = ls;
+                    assign beaten[pj] = ld_cdb_elig[pj] &&
+                        ((lsu_age[pj] < lsu_age[ls]) || ((lsu_age[pj] == lsu_age[ls]) && (PJ_I < LS_I)));
+                end
+            end
+            assign ld_cdb_pick[ls] = ld_cdb_elig[ls] && !(|beaten);
+        end
+    endgenerate
+
+    wire       ld_cdb_req       = |ld_cdb_elig;
+    wire [2:0] ld_cdb_pick_slot =
+        ld_cdb_pick[0] ? 3'd0 : ld_cdb_pick[1] ? 3'd1 : ld_cdb_pick[2] ? 3'd2 : ld_cdb_pick[3] ? 3'd3 :
+        ld_cdb_pick[4] ? 3'd4 : ld_cdb_pick[5] ? 3'd5 : ld_cdb_pick[6] ? 3'd6 : 3'd7;
 
     wire lsu_st_pop = rob_commit && rob_is_store[rob_head];
-    wire lsu_pop    = lsu_ld_trap_fire || o_ld_gnt || lsu_st_pop;
-    wire lsu_push   = issue_fire && cls_mem;
+    wire lsu_head_ld_pop = lsu_valid[lsu_head] && lsu_is_load[lsu_head] && (
+        (lsu_ld_state[lsu_head] == LD_DONE) ||
+        (o_ld_gnt && (ld_cdb_pick_slot == lsu_head)) ||
+        lsu_ld_trap_fire[lsu_head]
+    );
+    wire lsu_pop  = lsu_head_ld_pop || lsu_st_pop;
+    wire lsu_push = issue_fire && cls_mem;
 
     // ========================================================================
     // 9. CDB Arbiter (cdb_arb.v) & Complete Interface
     // ========================================================================
     cdb_arb #(.TAG_W(3)) cdb_arb_i (
         .i_rob_head  (rob_head),
-        .i_alu_v     (alu_cdb_v),
-        .i_alu_tag   (alu_cdb_tag),
-        .i_alu_rd    (alu_cdb_rd),
-        .i_alu_val   (alu_cdb_val),
-        .i_alu_pc    (alu_cdb_pc),
+        .i_alu_v     (alu_mux_v),
+        .i_alu_tag   (alu_mux_tag),
+        .i_alu_rd    (alu_mux_rd),
+        .i_alu_val   (alu_mux_val),
+        .i_alu_pc    (alu_mux_pc),
         .i_fp0_v     (fp0_cdb_v),
         .i_fp0_tag   (fp0_cdb_tag),
         .i_fp0_rd    (fp0_cdb_rd),
@@ -880,10 +1226,10 @@ module hart #(
         .i_fp1_val   (fp1_cdb_val),
         .i_fp1_pc    (fp1_cdb_pc),
         .i_ld_v      (ld_cdb_req),
-        .i_ld_tag    (lsu_tag[lsu_head]),
-        .i_ld_rd     (lsu_rd[lsu_head]),
-        .i_ld_val    (ld_cdb_req_val),
-        .i_ld_pc     (lsu_pc[lsu_head]),
+        .i_ld_tag    (lsu_tag[ld_cdb_pick_slot]),
+        .i_ld_rd     (lsu_rd[ld_cdb_pick_slot]),
+        .i_ld_val    (lsu_ld_val[ld_cdb_pick_slot]),
+        .i_ld_pc     (lsu_pc[ld_cdb_pick_slot]),
         .o_alu_gnt   (o_alu_gnt),
         .o_fp0_gnt   (o_fp0_gnt),
         .o_fp1_gnt   (o_fp1_gnt),
@@ -902,40 +1248,215 @@ module hart #(
     assign o_complete_pc    = cdb_pc;
 
     // ========================================================================
-    // 10. Sequential State Updates (Frontend, ROB, ALU RS, FP RS, LSU, CDB Buffers)
+    // 10. Sequential State Updates & 1-Cycle Speculative RAT Recovery
     // ========================================================================
 
-    // 10.1 Frontend (PC, IF/ID, ctrl_inflight, halted_issued)
+    // 10.1 Frontend, BTB, PHT, GHR, RAS
+    integer bi, pi_idx;
+    wire [5:0] upd_btb_idx = alu0_sel_pc[7:2];
+    wire [6:0] upd_pht_idx = alu0_sel_pc[8:2] ^ rob_ghr_ckpt[alu0_sel_tag];
+    wire [1:0] upd_pht_old = pht[upd_pht_idx];
+    wire [1:0] upd_pht_new = alu_br_taken ?
+        ((upd_pht_old == 2'b11) ? 2'b11 : (upd_pht_old + 2'd1)) :
+        ((upd_pht_old == 2'b00) ? 2'b00 : (upd_pht_old - 2'd1));
+
     always @(posedge i_clk) begin
         if (i_rst) begin
-            PC             <= RESET_ADDR;
-            IF_ID_PC       <= 32'd0;
-            IF_ID_instruct <= 32'h00000013;
-            IF_ID_valid    <= 1'b0;
-            ctrl_inflight  <= 1'b0;
-            halted_issued  <= 1'b0;
+            PC               <= RESET_ADDR;
+            IF_ID_PC         <= 32'd0;
+            IF_ID_instruct   <= 32'h00000013;
+            IF_ID_valid      <= 1'b0;
+            IF_ID_pred_taken <= 1'b0;
+            IF_ID_pred_pc    <= 32'd0;
+            IF_ID_btb_hit    <= 1'b0;
+            IF_ID_ghr        <= 7'd0;
+            halted_issued    <= 1'b0;
+            ghr              <= 7'd0;
+            ras_sp           <= 3'd0;
+
+            for (bi = 0; bi < 64; bi = bi + 1) begin
+                btb_valid[bi]  <= 1'b0;
+                btb_tag[bi]    <= 24'd0;
+                btb_target[bi] <= 32'd0;
+                btb_uncond[bi] <= 1'b0;
+                btb_is_ret[bi] <= 1'b0;
+            end
+            for (pi_idx = 0; pi_idx < 128; pi_idx = pi_idx + 1) begin
+                pht[pi_idx] <= 2'b01; // weakly not taken
+            end
+            for (bi = 0; bi < 8; bi = bi + 1) begin
+                ras_stack[bi] <= RESET_ADDR;
+            end
         end else begin
-            if (redirect_taken) begin
-                PC             <= redirect_pc;
-                IF_ID_PC       <= 32'd0;
-                IF_ID_instruct <= 32'h00000013;
-                IF_ID_valid    <= 1'b0;
+            // Frontend PC & IF/ID update
+            if (mispredict_fire) begin
+                PC               <= effective_next_pc;
+                IF_ID_PC         <= 32'd0;
+                IF_ID_instruct   <= 32'h00000013;
+                IF_ID_valid      <= 1'b0;
+                IF_ID_pred_taken <= 1'b0;
+                IF_ID_pred_pc    <= 32'd0;
+                IF_ID_btb_hit    <= 1'b0;
+            end else if (dec_redirect) begin
+                PC               <= dec_override_target;
+                IF_ID_PC         <= 32'd0;
+                IF_ID_instruct   <= 32'h00000013;
+                IF_ID_valid      <= 1'b0;
+                IF_ID_pred_taken <= 1'b0;
+                IF_ID_pred_pc    <= 32'd0;
+                IF_ID_btb_hit    <= 1'b0;
             end else if (!(issue_stall || halted_issued || trap_wb_stall)) begin
-                PC             <= pc_plus_4;
-                IF_ID_PC       <= PC;
-                IF_ID_instruct <= i_imem_rdata;
-                IF_ID_valid    <= 1'b1;
+                PC               <= fetch_next_pc;
+                IF_ID_PC         <= PC;
+                IF_ID_instruct   <= i_imem_rdata;
+                IF_ID_valid      <= 1'b1;
+                IF_ID_pred_taken <= fetch_pred_taken;
+                IF_ID_pred_pc    <= fetch_next_pc;
+                IF_ID_btb_hit    <= fetch_btb_hit;
+                IF_ID_ghr        <= ghr;
             end
 
-            if (alu_resolve_fire)
-                ctrl_inflight <= 1'b0;
-            else if (issue_fire && cls_brjmp)
-                ctrl_inflight <= 1'b1;
-
-            if (issue_fire && r_halt)
+            // Halt state (squash if speculative ebreak flushed)
+            if (mispredict_fire)
+                halted_issued <= 1'b0;
+            else if (issue_fire && r_halt)
                 halted_issued <= 1'b1;
+
+            // GHR update / restore
+            if (mispredict_fire) begin
+                if (alu0_sel_branch)
+                    ghr <= {rob_ghr_ckpt[alu0_sel_tag][5:0], alu_br_taken};
+                else
+                    ghr <= rob_ghr_ckpt[alu0_sel_tag];
+            end else if (issue_fire && r_legal && r_branch) begin
+                ghr <= {ghr[5:0], iss_pred_taken};
+            end
+
+            // RAS update / restore
+            if (mispredict_fire) begin
+                if (rob_is_ret[alu0_sel_tag] && !rob_is_call[alu0_sel_tag])
+                    ras_sp <= rob_ras_sp_ckpt[alu0_sel_tag] - 3'd1;
+                else if (rob_is_call[alu0_sel_tag] && !rob_is_ret[alu0_sel_tag]) begin
+                    ras_stack[rob_ras_sp_ckpt[alu0_sel_tag]] <= alu0_sel_pc + 32'd4;
+                    ras_sp <= rob_ras_sp_ckpt[alu0_sel_tag] + 3'd1;
+                end else
+                    ras_sp <= rob_ras_sp_ckpt[alu0_sel_tag];
+            end else if (issue_fire) begin
+                if (iss_is_ret && !iss_is_call)
+                    ras_sp <= ras_sp - 3'd1;
+                else if (iss_is_call && !iss_is_ret) begin
+                    ras_stack[ras_sp] <= IF_ID_PC + 32'd4;
+                    ras_sp <= ras_sp + 3'd1;
+                end else if (iss_is_call && iss_is_ret) begin
+                    ras_stack[ras_sp - 3'd1] <= IF_ID_PC + 32'd4;
+                end
+            end
+
+            // Branch Predictor Training at Execute
+            if (alu_resolve_fire && !alu_br_trap) begin
+                if (alu0_sel_branch) begin
+                    pht[upd_pht_idx] <= upd_pht_new;
+                    if (alu_br_taken || (btb_valid[upd_btb_idx] && (btb_tag[upd_btb_idx] == alu0_sel_pc[31:8]))) begin
+                        btb_valid[upd_btb_idx]  <= 1'b1;
+                        btb_tag[upd_btb_idx]    <= alu0_sel_pc[31:8];
+                        btb_target[upd_btb_idx] <= alu_br_target;
+                        btb_uncond[upd_btb_idx] <= 1'b0;
+                        btb_is_ret[upd_btb_idx] <= 1'b0;
+                    end
+                end else if (alu0_sel_jump) begin
+                    btb_valid[upd_btb_idx]  <= 1'b1;
+                    btb_tag[upd_btb_idx]    <= alu0_sel_pc[31:8];
+                    btb_target[upd_btb_idx] <= alu_jmp_target;
+                    btb_uncond[upd_btb_idx] <= 1'b1;
+                    btb_is_ret[upd_btb_idx] <= rob_is_ret[alu0_sel_tag];
+                end
+            end
         end
     end
+
+    // 10.1b Speculative RAT with 1-Cycle ROB Recovery on Mispredict
+    wire [2:0] rob_slot_age [0:7];
+    wire [7:0] rob_survives_age;
+    genvar sk;
+    generate
+        for (sk = 0; sk < 8; sk = sk + 1) begin : gen_rob_surv
+            localparam [2:0] SK_I = sk;
+            assign rob_slot_age[sk]     = rob_head + SK_I;
+            assign rob_survives_age[sk] = rob_valid[rob_slot_age[sk]] &&
+                                          !(rob_commit && (sk == 0)) &&
+                                          (SK_I <= misp_b_age);
+        end
+    endgenerate
+
+    wire int_issue_valid  = issue_fire && !r_frd_en && (r_rd != 5'd0);
+    wire int_commit_valid = rob_commit && !rob_frd_en[rob_head] && (rob_rd[rob_head] != 5'd0);
+    wire fp_issue_valid   = issue_fire && r_frd_en;
+    wire fp_commit_valid  = rob_commit && rob_frd_en[rob_head];
+
+    genvar rr;
+    generate
+        for (rr = 0; rr < 32; rr = rr + 1) begin : gen_spec_rat
+            localparam [4:0] RR_IDX = rr;
+
+            wire [7:0] int_surv_wr;
+            wire [7:0] fp_surv_wr;
+            for (sk = 0; sk < 8; sk = sk + 1) begin : gen_rat_rec
+                assign int_surv_wr[sk] = rob_survives_age[sk] && rob_int_wen[rob_slot_age[sk]] && (rob_rd[rob_slot_age[sk]] == RR_IDX);
+                assign fp_surv_wr[sk]  = rob_survives_age[sk] && rob_frd_en[rob_slot_age[sk]]  && (rob_rd[rob_slot_age[sk]] == RR_IDX);
+            end
+
+            wire       int_rec_busy = |int_surv_wr;
+            wire [2:0] int_rec_tag  =
+                int_surv_wr[7] ? rob_slot_age[7] : int_surv_wr[6] ? rob_slot_age[6] :
+                int_surv_wr[5] ? rob_slot_age[5] : int_surv_wr[4] ? rob_slot_age[4] :
+                int_surv_wr[3] ? rob_slot_age[3] : int_surv_wr[2] ? rob_slot_age[2] :
+                int_surv_wr[1] ? rob_slot_age[1] : rob_slot_age[0];
+
+            wire       fp_rec_busy = |fp_surv_wr;
+            wire [2:0] fp_rec_tag  =
+                fp_surv_wr[7] ? rob_slot_age[7] : fp_surv_wr[6] ? rob_slot_age[6] :
+                fp_surv_wr[5] ? rob_slot_age[5] : fp_surv_wr[4] ? rob_slot_age[4] :
+                fp_surv_wr[3] ? rob_slot_age[3] : fp_surv_wr[2] ? rob_slot_age[2] :
+                fp_surv_wr[1] ? rob_slot_age[1] : rob_slot_age[0];
+
+            always @(posedge i_clk) begin
+                if (i_rst) begin
+                    spec_int_busy[rr] <= 1'b0;
+                    spec_int_tag[rr]  <= 3'd0;
+                end else if (rr == 0) begin
+                    spec_int_busy[rr] <= 1'b0;
+                    spec_int_tag[rr]  <= 3'd0;
+                end else if (mispredict_fire) begin
+                    spec_int_busy[rr] <= int_rec_busy;
+                    if (int_rec_busy)
+                        spec_int_tag[rr] <= int_rec_tag;
+                end else if (int_issue_valid && (r_rd == RR_IDX)) begin
+                    spec_int_busy[rr] <= 1'b1;
+                    spec_int_tag[rr]  <= rob_tail;
+                end else if (int_commit_valid && (rob_rd[rob_head] == RR_IDX) &&
+                             spec_int_busy[rr] && (spec_int_tag[rr] == rob_head)) begin
+                    spec_int_busy[rr] <= 1'b0;
+                end
+            end
+
+            always @(posedge i_clk) begin
+                if (i_rst) begin
+                    spec_fp_busy[rr] <= 1'b0;
+                    spec_fp_tag[rr]  <= 3'd0;
+                end else if (mispredict_fire) begin
+                    spec_fp_busy[rr] <= fp_rec_busy;
+                    if (fp_rec_busy)
+                        spec_fp_tag[rr] <= fp_rec_tag;
+                end else if (fp_issue_valid && (r_rd == RR_IDX)) begin
+                    spec_fp_busy[rr] <= 1'b1;
+                    spec_fp_tag[rr]  <= rob_tail;
+                end else if (fp_commit_valid && (rob_rd[rob_head] == RR_IDX) &&
+                             spec_fp_busy[rr] && (spec_fp_tag[rr] == rob_head)) begin
+                    spec_fp_busy[rr] <= 1'b0;
+                end
+            end
+        end
+    endgenerate
 
     // 10.2 ROB Head / Tail / Count & Architectural FCSR
     wire [11:0] fp0_csr_addr   = fp_rs_inst[fp0_sel_slot][31:20];
@@ -971,28 +1492,45 @@ module hart #(
         end else begin
             if (rob_commit)
                 rob_head <= rob_head + 3'd1;
-            if (issue_fire)
-                rob_tail <= rob_tail + 3'd1;
-            rob_count <= rob_count + (issue_fire ? 4'd1 : 4'd0) - (rob_commit ? 4'd1 : 4'd0);
+
+            if (mispredict_fire) begin
+                rob_tail  <= alu0_sel_tag + 3'd1;
+                rob_count <= {1'b0, misp_b_age} + 4'd1 - (rob_commit ? 4'd1 : 4'd0);
+            end else begin
+                if (issue_fire)
+                    rob_tail <= rob_tail + 3'd1;
+                rob_count <= rob_count + (issue_fire ? 4'd1 : 4'd0) - (rob_commit ? 4'd1 : 4'd0);
+            end
 
             if (rob_commit && !rob_trap[rob_head] && rob_is_fpu[rob_head])
                 arch_fcsr <= {commit_frm_next, commit_fflags_next};
         end
     end
 
-    // 10.3 ROB Entries (generated per entry to obey no-procedural-loop rule)
-    genvar rg;
+    // 10.3 ROB Entries
+    genvar rg, ls2;
     generate
         for (rg = 0; rg < ROB_SIZE; rg = rg + 1) begin : gen_rob_entry
             localparam [2:0] RG_TAG = rg;
-            wire alloc_this  = issue_fire && (rob_tail == RG_TAG);
-            wire commit_this = rob_commit && (rob_head == RG_TAG);
-            wire cdb_this    = cdb_valid  && (cdb_tag  == RG_TAG);
-            wire alu_res_this = alu_resolve_fire && (alu_sel_tag == RG_TAG);
+            wire alloc_this   = issue_fire && (rob_tail == RG_TAG);
+            wire commit_this  = rob_commit && (rob_head == RG_TAG);
+            wire flush_this   = mispredict_fire && rob_valid[rg] && ((RG_TAG - rob_head) > misp_b_age);
+            wire cdb_this     = cdb_valid  && (cdb_tag  == RG_TAG);
+            wire alu_res_this = alu_resolve_fire && (alu0_sel_tag == RG_TAG);
             wire fp0_rm_this  = fp0_disp_fire && fp0_rm_trap && (fp_rs_tag[fp0_sel_slot] == RG_TAG);
             wire fp1_rm_this  = fp1_disp_fire && fp1_rm_trap && (fp_rs_tag[fp1_sel_slot] == RG_TAG);
-            wire ld_trap_this = lsu_ld_trap_fire && (lsu_tag[lsu_head] == RG_TAG);
-            wire st_prep_this = lsu_st_prep_fire && (lsu_tag[lsu_head] == RG_TAG);
+
+            wire [7:0] ld_trap_vec;
+            wire [7:0] st_prep_vec;
+            for (ls2 = 0; ls2 < 8; ls2 = ls2 + 1) begin : gen_lsu_rob_match
+                assign ld_trap_vec[ls2] = lsu_ld_trap_fire[ls2] && (lsu_tag[ls2] == RG_TAG);
+                assign st_prep_vec[ls2] = lsu_st_prep_fire[ls2] && (lsu_tag[ls2] == RG_TAG);
+            end
+            wire ld_trap_this = |ld_trap_vec;
+            wire st_prep_this = |st_prep_vec;
+            wire [2:0] st_prep_slot =
+                st_prep_vec[0] ? 3'd0 : st_prep_vec[1] ? 3'd1 : st_prep_vec[2] ? 3'd2 : st_prep_vec[3] ? 3'd3 :
+                st_prep_vec[4] ? 3'd4 : st_prep_vec[5] ? 3'd5 : st_prep_vec[6] ? 3'd6 : 3'd7;
 
             always @(posedge i_clk) begin
                 if (i_rst) begin
@@ -1038,6 +1576,15 @@ module hart #(
                     rob_dmem_wen[rg]    <= 1'b0;
                     rob_dmem_rdata[rg]  <= 32'd0;
                     rob_dmem_wdata[rg]  <= 32'd0;
+                    rob_pred_pc[rg]     <= 32'd0;
+                    rob_ghr_ckpt[rg]    <= 7'd0;
+                    rob_ras_sp_ckpt[rg] <= 3'd0;
+                    rob_is_call[rg]     <= 1'b0;
+                    rob_is_ret[rg]      <= 1'b0;
+                end else if (flush_this) begin
+                    rob_valid[rg]      <= 1'b0;
+                    rob_done[rg]       <= 1'b0;
+                    rob_is_fpu_csr[rg] <= 1'b0;
                 end else if (alloc_this) begin
                     rob_valid[rg]       <= 1'b1;
                     rob_done[rg]        <= cls_illegal_or_halt;
@@ -1081,12 +1628,16 @@ module hart #(
                     rob_dmem_wen[rg]    <= 1'b0;
                     rob_dmem_rdata[rg]  <= 32'd0;
                     rob_dmem_wdata[rg]  <= 32'd0;
+                    rob_pred_pc[rg]     <= iss_pred_pc;
+                    rob_ghr_ckpt[rg]    <= ghr;
+                    rob_ras_sp_ckpt[rg] <= ras_sp;
+                    rob_is_call[rg]     <= iss_is_call;
+                    rob_is_ret[rg]      <= iss_is_ret;
                 end else if (commit_this) begin
                     rob_valid[rg]      <= 1'b0;
                     rob_done[rg]       <= 1'b0;
                     rob_is_fpu_csr[rg] <= 1'b0;
                 end else if (rob_valid[rg]) begin
-                    // Operand snooping on CDB & trap-restore wakeup
                     if (cdb_valid && rob_op1_qv[rg] && (rob_op1_qt[rg] == cdb_tag)) begin
                         rob_op1_val[rg] <= cdb_val;
                         rob_op1_qv[rg]  <= 1'b0;
@@ -1111,7 +1662,6 @@ module hart #(
                         rob_op3_qv[rg]  <= 1'b0;
                     end
 
-                    // CDB completion
                     if (cdb_this) begin
                         rob_done[rg]  <= 1'b1;
                         rob_value[rg] <= cdb_val;
@@ -1120,14 +1670,13 @@ module hart #(
                         else if (o_fp1_gnt)
                             rob_fflags[rg] <= fp1_cdb_fflags;
                         if (o_ld_gnt) begin
-                            rob_dmem_addr[rg]  <= ld_cdb_req_waddr;
-                            rob_dmem_mask[rg]  <= ld_cdb_req_mask;
+                            rob_dmem_addr[rg]  <= lsu_ld_waddr[ld_cdb_pick_slot];
+                            rob_dmem_mask[rg]  <= lsu_ld_mask[ld_cdb_pick_slot];
                             rob_dmem_ren[rg]   <= 1'b1;
-                            rob_dmem_rdata[rg] <= ld_cdb_req_raw;
+                            rob_dmem_rdata[rg] <= lsu_ld_raw[ld_cdb_pick_slot];
                         end
                     end
 
-                    // Branch/jump resolve (sets next_pc; traps if target misaligned)
                     if (alu_res_this) begin
                         rob_next_pc[rg] <= alu_next_pc;
                         if (alu_br_trap) begin
@@ -1136,14 +1685,12 @@ module hart #(
                         end
                     end
 
-                    // FPU CSR metadata capture at dispatch
                     if (fp0_disp_fire && !fp0_rm_trap && (fp_rs_tag[fp0_sel_slot] == RG_TAG) &&
                         fp_rs_is_csr[fp0_sel_slot]) begin
                         rob_frm_new[rg] <= fp0_csr_new_frm;
                         rob_frm_wen[rg] <= fp0_csr_frm_we;
                     end
 
-                    // Non-CDB traps and store preparation
                     if (fp0_rm_this || fp1_rm_this || ld_trap_this) begin
                         rob_trap[rg] <= 1'b1;
                         rob_done[rg] <= 1'b1;
@@ -1151,53 +1698,97 @@ module hart #(
 
                     if (st_prep_this) begin
                         rob_done[rg]       <= 1'b1;
-                        rob_trap[rg]       <= rob_trap[rg] | lsu_misaligned;
-                        rob_dmem_addr[rg]  <= {lsu_eff_addr[31:2], 2'b00};
-                        rob_dmem_mask[rg]  <= lsu_misaligned ? 4'd0 : lsu_mask;
-                        rob_dmem_wen[rg]   <= !lsu_misaligned;
-                        rob_dmem_wdata[rg] <= lsu_wdata_shifted;
+                        rob_trap[rg]       <= rob_trap[rg] | lsu_misal_c[st_prep_slot];
+                        rob_dmem_addr[rg]  <= lsu_waddr_c[st_prep_slot];
+                        rob_dmem_mask[rg]  <= lsu_misal_c[st_prep_slot] ? 4'd0 : lsu_mask_c[st_prep_slot];
+                        rob_dmem_wen[rg]   <= !lsu_misal_c[st_prep_slot];
+                        rob_dmem_wdata[rg] <= lsu_wdata_c[st_prep_slot];
                     end
                 end
             end
         end
     endgenerate
 
-    // 10.4 ALU RS Entries & ALU CDB Buffer
+    // 10.4 ALU0, ALU1, DIV Unit CDB Buffers (with Mispredict Flush)
+    wire alu1_cdb_flush   = mispredict_fire && alu1_cdb_v && ((alu1_cdb_tag - rob_head) > misp_b_age);
+    wire alu1_disp_flush  = mispredict_fire && ((alu_rs_tag[alu1_sel_slot] - rob_head) > misp_b_age);
+    wire div_cdb_flush    = mispredict_fire && div_cdb_v && ((div_cdb_tag - rob_head) > misp_b_age);
+
     always @(posedge i_clk) begin
         if (i_rst) begin
-            alu_div_active <= 1'b0;
-            alu_div_slot   <= 2'd0;
-            alu_cdb_v      <= 1'b0;
-            alu_cdb_tag    <= 3'd0;
-            alu_cdb_rd     <= 5'd0;
-            alu_cdb_val    <= 32'd0;
-            alu_cdb_pc     <= 32'd0;
+            div_active      <= 1'b0;
+            div_active_slot <= 3'd0;
+            alu0_cdb_v      <= 1'b0;
+            alu0_cdb_tag    <= 3'd0;
+            alu0_cdb_rd     <= 5'd0;
+            alu0_cdb_val    <= 32'd0;
+            alu0_cdb_pc     <= 32'd0;
+            alu1_cdb_v      <= 1'b0;
+            alu1_cdb_tag    <= 3'd0;
+            alu1_cdb_rd     <= 5'd0;
+            alu1_cdb_val    <= 32'd0;
+            alu1_cdb_pc     <= 32'd0;
+            div_cdb_v       <= 1'b0;
+            div_cdb_tag     <= 3'd0;
+            div_cdb_rd      <= 5'd0;
+            div_cdb_val     <= 32'd0;
+            div_cdb_pc      <= 32'd0;
         end else begin
-            if (alu_sel_valid && alu_sel_is_div && alu_out_busy) begin
-                alu_div_active <= 1'b1;
-                alu_div_slot   <= alu_sel_slot;
-            end else if (alu_disp_fire) begin
-                alu_div_active <= 1'b0;
+            if (div_slot_flushed) begin
+                div_active <= 1'b0;
+            end else if (div_sel_valid && div_out_busy) begin
+                div_active      <= 1'b1;
+                div_active_slot <= div_sel_slot;
+            end else if (div_disp_fire) begin
+                div_active      <= 1'b0;
             end
 
-            if (alu_disp_fire && !alu_br_trap) begin
-                alu_cdb_v   <= 1'b1;
-                alu_cdb_tag <= alu_sel_tag;
-                alu_cdb_rd  <= alu_sel_branch ? 5'd0 : alu_sel_rd;
-                alu_cdb_val <= alu_cdb_calc_val;
-                alu_cdb_pc  <= alu_sel_pc;
-            end else if (o_alu_gnt) begin
-                alu_cdb_v <= 1'b0;
+            if (alu0_disp_fire && !alu_br_trap) begin
+                alu0_cdb_v   <= 1'b1;
+                alu0_cdb_tag <= alu0_sel_tag;
+                alu0_cdb_rd  <= alu0_sel_branch ? 5'd0 : alu0_sel_rd;
+                alu0_cdb_val <= alu0_cdb_calc_val;
+                alu0_cdb_pc  <= alu0_sel_pc;
+            end else if (alu0_cdb_gnt) begin
+                alu0_cdb_v <= 1'b0;
+            end
+
+            if (alu1_cdb_flush) begin
+                alu1_cdb_v <= 1'b0;
+            end else if (alu1_disp_fire && !alu1_disp_flush) begin
+                alu1_cdb_v   <= 1'b1;
+                alu1_cdb_tag <= alu_rs_tag[alu1_sel_slot];
+                alu1_cdb_rd  <= alu_rs_rd[alu1_sel_slot];
+                alu1_cdb_val <= alu1_cdb_calc_val;
+                alu1_cdb_pc  <= alu_rs_pc[alu1_sel_slot];
+            end else if (alu1_cdb_gnt) begin
+                alu1_cdb_v <= 1'b0;
+            end
+
+            if (div_cdb_flush) begin
+                div_cdb_v <= 1'b0;
+            end else if (div_disp_fire && !div_slot_flushed) begin
+                div_cdb_v   <= 1'b1;
+                div_cdb_tag <= alu_rs_tag[div_sel_slot];
+                div_cdb_rd  <= alu_rs_rd[div_sel_slot];
+                div_cdb_val <= div_out_result;
+                div_cdb_pc  <= alu_rs_pc[div_sel_slot];
+            end else if (div_cdb_gnt) begin
+                div_cdb_v <= 1'b0;
             end
         end
     end
 
+    // ALU RS Entries
     genvar as;
     generate
         for (as = 0; as < ALU_RS_SIZE; as = as + 1) begin : gen_alu_rs_entry
-            localparam [1:0] AS_IDX = as;
+            localparam [2:0] AS_IDX = as;
             wire alloc_as = issue_fire && (cls_alu || cls_brjmp) && (alu_rs_free_idx == AS_IDX);
-            wire free_as  = alu_disp_fire && (alu_sel_slot == AS_IDX);
+            wire flush_as = mispredict_fire && alu_rs_valid[as] && ((alu_rs_tag[as] - rob_head) > misp_b_age);
+            wire free_as  = (alu0_disp_fire && (alu0_sel_slot == AS_IDX)) ||
+                            (alu1_disp_fire && (alu1_sel_slot == AS_IDX)) ||
+                            (div_disp_fire  && (div_sel_slot  == AS_IDX));
 
             always @(posedge i_clk) begin
                 if (i_rst) begin
@@ -1225,6 +1816,8 @@ module hart #(
                     alu_rs_op2_val[as]  <= 32'd0;
                     alu_rs_q2_v[as]     <= 1'b0;
                     alu_rs_q2_t[as]     <= 3'd0;
+                end else if (flush_as) begin
+                    alu_rs_valid[as] <= 1'b0;
                 end else if (alloc_as) begin
                     alu_rs_valid[as]    <= 1'b1;
                     alu_rs_tag[as]      <= rob_tail;
@@ -1273,16 +1866,16 @@ module hart #(
         end
     endgenerate
 
-    // 10.5 FP RS Entries, FPU Busy Trackers, FPU CDB Buffers, Sync Flags
-    wire fcsr_changed_on_commit = rob_commit && !rob_trap[rob_head] && rob_is_fpu[rob_head] &&
-                                  ({commit_frm_next, commit_fflags_next} != arch_fcsr);
+    // 10.5 FP RS Entries, FPU Busy Trackers, FPU CDB Buffers (with Mispredict Flush)
+    wire fp0_cdb_flush = mispredict_fire && fp0_cdb_v && ((fp0_cdb_tag - rob_head) > misp_b_age);
+    wire fp1_cdb_flush = mispredict_fire && fp1_cdb_v && ((fp1_cdb_tag - rob_head) > misp_b_age);
 
     always @(posedge i_clk) begin
         if (i_rst) begin
             fp0_busy_slot_v <= 1'b0;
-            fp0_busy_slot   <= 2'd0;
+            fp0_busy_slot   <= 3'd0;
             fp1_busy_slot_v <= 1'b0;
-            fp1_busy_slot   <= 2'd0;
+            fp1_busy_slot   <= 3'd0;
             fp0_cdb_v       <= 1'b0;
             fp0_cdb_tag     <= 3'd0;
             fp0_cdb_rd      <= 5'd0;
@@ -1295,24 +1888,28 @@ module hart #(
             fp1_cdb_val     <= 32'd0;
             fp1_cdb_pc      <= 32'd0;
             fp1_cdb_fflags  <= 5'd0;
-            fp0_needs_sync  <= 1'b0;
-            fp1_needs_sync  <= 1'b0;
         end else begin
-            if (fp0_sel_valid && fp0_busy) begin
+            if (fp0_slot_flushed) begin
+                fp0_busy_slot_v <= 1'b0;
+            end else if (fp0_sel_valid && fp0_busy) begin
                 fp0_busy_slot_v <= 1'b1;
                 fp0_busy_slot   <= fp0_sel_slot;
             end else if (fp0_disp_fire) begin
                 fp0_busy_slot_v <= 1'b0;
             end
 
-            if (fp1_sel_valid && fp1_busy) begin
+            if (fp1_slot_flushed) begin
+                fp1_busy_slot_v <= 1'b0;
+            end else if (fp1_sel_valid && fp1_busy) begin
                 fp1_busy_slot_v <= 1'b1;
                 fp1_busy_slot   <= fp1_sel_slot;
             end else if (fp1_disp_fire) begin
                 fp1_busy_slot_v <= 1'b0;
             end
 
-            if (fp0_disp_fire && !fp0_rm_trap) begin
+            if (fp0_cdb_flush) begin
+                fp0_cdb_v <= 1'b0;
+            end else if (fp0_disp_fire && !fp0_rm_trap && !fp0_slot_flushed) begin
                 fp0_cdb_v      <= 1'b1;
                 fp0_cdb_tag    <= fp_rs_tag[fp0_sel_slot];
                 fp0_cdb_rd     <= fp_rs_rd[fp0_sel_slot];
@@ -1323,7 +1920,9 @@ module hart #(
                 fp0_cdb_v <= 1'b0;
             end
 
-            if (fp1_disp_fire && !fp1_rm_trap) begin
+            if (fp1_cdb_flush) begin
+                fp1_cdb_v <= 1'b0;
+            end else if (fp1_disp_fire && !fp1_rm_trap && !fp1_slot_flushed) begin
                 fp1_cdb_v      <= 1'b1;
                 fp1_cdb_tag    <= fp_rs_tag[fp1_sel_slot];
                 fp1_cdb_rd     <= fp_rs_rd[fp1_sel_slot];
@@ -1333,24 +1932,15 @@ module hart #(
             end else if (o_fp1_gnt) begin
                 fp1_cdb_v <= 1'b0;
             end
-
-            if (fcsr_changed_on_commit)
-                fp0_needs_sync <= 1'b1;
-            else if (fp0_sync_now)
-                fp0_needs_sync <= 1'b0;
-
-            if (fcsr_changed_on_commit)
-                fp1_needs_sync <= 1'b1;
-            else if (fp1_sync_now)
-                fp1_needs_sync <= 1'b0;
         end
     end
 
     genvar fs;
     generate
         for (fs = 0; fs < FP_RS_SIZE; fs = fs + 1) begin : gen_fp_rs_entry
-            localparam [1:0] FS_IDX = fs;
+            localparam [2:0] FS_IDX = fs;
             wire alloc_fs = issue_fire && cls_fpu && (fp_rs_free_idx == FS_IDX);
+            wire flush_fs = mispredict_fire && fp_rs_valid[fs] && ((fp_rs_tag[fs] - rob_head) > misp_b_age);
             wire free_fs  = (fp0_disp_fire && (fp0_sel_slot == FS_IDX)) ||
                             (fp1_disp_fire && (fp1_sel_slot == FS_IDX));
 
@@ -1373,6 +1963,8 @@ module hart #(
                     fp_rs_op3_val[fs] <= 32'd0;
                     fp_rs_q3_v[fs]    <= 1'b0;
                     fp_rs_q3_t[fs]    <= 3'd0;
+                end else if (flush_fs) begin
+                    fp_rs_valid[fs] <= 1'b0;
                 end else if (alloc_fs) begin
                     fp_rs_valid[fs]   <= 1'b1;
                     fp_rs_tag[fs]     <= rob_tail;
@@ -1422,97 +2014,142 @@ module hart #(
         end
     endgenerate
 
-    // 10.6 LSU Pointers, Store Commit Latch, Load CDB Hold Buffer, LSU Entries
+    // 10.6 LSU Pointers & Entries (with Mispredict Flush)
+    wire [7:0] lsu_flush_vec;
+    wire [7:0] lsu_surv_vec;
+    generate
+        for (ls = 0; ls < LSU_SIZE; ls = ls + 1) begin : gen_lsu_surv
+            localparam [2:0] LS_I = ls;
+            assign lsu_flush_vec[ls] = mispredict_fire && lsu_valid[ls] && ((lsu_tag[ls] - rob_head) > misp_b_age);
+            assign lsu_surv_vec[ls]  = lsu_valid[ls] && !lsu_flush_vec[ls] && !(lsu_pop && (lsu_head == LS_I));
+        end
+    endgenerate
+
+    wire [3:0] surv_lsu_count =
+        {3'd0, lsu_surv_vec[0]} + {3'd0, lsu_surv_vec[1]} + {3'd0, lsu_surv_vec[2]} + {3'd0, lsu_surv_vec[3]} +
+        {3'd0, lsu_surv_vec[4]} + {3'd0, lsu_surv_vec[5]} + {3'd0, lsu_surv_vec[6]} + {3'd0, lsu_surv_vec[7]};
+    wire [2:0] next_lsu_head = lsu_pop ? (lsu_head + 3'd1) : lsu_head;
+
     always @(posedge i_clk) begin
         if (i_rst) begin
-            lsu_head         <= 3'd0;
-            lsu_tail         <= 3'd0;
-            lsu_count        <= 4'd0;
-            lsu_st_byte_addr <= 32'd0;
-            lsu_st_mask      <= 4'd0;
-            lsu_st_wdata     <= 32'd0;
-            ld_buf_valid     <= 1'b0;
-            ld_buf_val       <= 32'd0;
-            ld_buf_raw_rdata <= 32'd0;
-            ld_buf_word_addr <= 32'd0;
-            ld_buf_mask      <= 4'd0;
+            lsu_head  <= 3'd0;
+            lsu_tail  <= 3'd0;
+            lsu_count <= 4'd0;
+        end else if (mispredict_fire) begin
+            lsu_head  <= next_lsu_head;
+            lsu_tail  <= next_lsu_head + surv_lsu_count[2:0];
+            lsu_count <= surv_lsu_count;
         end else begin
             if (lsu_pop)
                 lsu_head <= lsu_head + 3'd1;
             if (lsu_push)
                 lsu_tail <= lsu_tail + 3'd1;
             lsu_count <= lsu_count + (lsu_push ? 4'd1 : 4'd0) - (lsu_pop ? 4'd1 : 4'd0);
-
-            if (lsu_st_prep_fire) begin
-                lsu_st_byte_addr <= lsu_eff_addr;
-                lsu_st_mask      <= lsu_misaligned ? 4'd0 : lsu_mask;
-                lsu_st_wdata     <= lsu_wdata_shifted;
-            end
-
-            if (o_ld_gnt) begin
-                ld_buf_valid <= 1'b0;
-            end else if (dcache_ren && dcache_ready) begin
-                // Lost CDB arbitration on cache-ready cycle: capture result so cache isn't re-read
-                ld_buf_valid     <= 1'b1;
-                ld_buf_val       <= lsu_load_ext;
-                ld_buf_raw_rdata <= dcache_rdata;
-                ld_buf_word_addr <= {lsu_eff_addr[31:2], 2'b00};
-                ld_buf_mask      <= lsu_mask;
-            end
         end
     end
 
-    genvar ls;
     generate
         for (ls = 0; ls < LSU_SIZE; ls = ls + 1) begin : gen_lsu_entry
             localparam [2:0] LS_IDX = ls;
-            wire alloc_ls = lsu_push && (lsu_tail == LS_IDX);
-            wire pop_ls   = lsu_pop  && (lsu_head == LS_IDX);
-            wire prep_ls  = lsu_st_prep_fire && (lsu_head == LS_IDX);
+            wire alloc_ls     = lsu_push && (lsu_tail == LS_IDX);
+            wire pop_ls       = lsu_pop  && (lsu_head == LS_IDX);
+            wire flush_ls     = lsu_flush_vec[ls];
+            wire prep_ls      = lsu_st_prep_fire[ls];
+            wire ld_trap_ls   = lsu_ld_trap_fire[ls];
+            wire ld_fwd_ls    = lsu_ld_fwd_fire[ls];
+            wire ld_dc_hit_ls = dcache_hit_fire  && (ld_dcache_pick_slot == LS_IDX);
+            wire ld_dc_mis_ls = dcache_miss_fire && (ld_dcache_pick_slot == LS_IDX);
+            wire ld_fill_ls   = dcache_fill_valid && lsu_valid[ls] && lsu_is_load[ls] &&
+                                (lsu_ld_state[ls] == LD_MISS) && (lsu_ld_blk_addr[ls] == dcache_fill_addr);
+            wire ld_gnt_ls    = o_ld_gnt && (ld_cdb_pick_slot == LS_IDX);
 
             always @(posedge i_clk) begin
                 if (i_rst) begin
-                    lsu_valid[ls]   <= 1'b0;
-                    lsu_tag[ls]     <= 3'd0;
-                    lsu_pc[ls]      <= 32'd0;
-                    lsu_rd[ls]      <= 5'd0;
-                    lsu_is_load[ls] <= 1'b0;
-                    lsu_imm[ls]     <= 32'd0;
-                    lsu_memb[ls]    <= 1'b0;
-                    lsu_memh[ls]    <= 1'b0;
-                    lsu_memw[ls]    <= 1'b0;
-                    lsu_memu[ls]    <= 1'b0;
-                    lsu_op1_val[ls] <= 32'd0;
-                    lsu_q1_v[ls]    <= 1'b0;
-                    lsu_q1_t[ls]    <= 3'd0;
-                    lsu_op2_val[ls] <= 32'd0;
-                    lsu_q2_v[ls]    <= 1'b0;
-                    lsu_q2_t[ls]    <= 3'd0;
-                    lsu_st_prep[ls] <= 1'b0;
+                    lsu_valid[ls]       <= 1'b0;
+                    lsu_tag[ls]         <= 3'd0;
+                    lsu_pc[ls]          <= 32'd0;
+                    lsu_rd[ls]          <= 5'd0;
+                    lsu_is_load[ls]     <= 1'b0;
+                    lsu_imm[ls]         <= 32'd0;
+                    lsu_memb[ls]        <= 1'b0;
+                    lsu_memh[ls]        <= 1'b0;
+                    lsu_memw[ls]        <= 1'b0;
+                    lsu_memu[ls]        <= 1'b0;
+                    lsu_op1_val[ls]     <= 32'd0;
+                    lsu_q1_v[ls]        <= 1'b0;
+                    lsu_q1_t[ls]        <= 3'd0;
+                    lsu_op2_val[ls]     <= 32'd0;
+                    lsu_q2_v[ls]        <= 1'b0;
+                    lsu_q2_t[ls]        <= 3'd0;
+                    lsu_st_prepped[ls]  <= 1'b0;
+                    lsu_st_baddr[ls]    <= 32'd0;
+                    lsu_st_mask[ls]     <= 4'd0;
+                    lsu_st_wdata[ls]    <= 32'd0;
+                    lsu_ld_state[ls]    <= LD_WAIT;
+                    lsu_ld_val[ls]      <= 32'd0;
+                    lsu_ld_raw[ls]      <= 32'd0;
+                    lsu_ld_waddr[ls]    <= 32'd0;
+                    lsu_ld_mask[ls]     <= 4'd0;
+                    lsu_ld_blk_addr[ls] <= 32'd0;
+                    lsu_ld_byte_off[ls] <= 2'd0;
+                end else if (pop_ls || flush_ls) begin
+                    lsu_valid[ls]      <= 1'b0;
+                    lsu_st_prepped[ls] <= 1'b0;
+                    lsu_ld_state[ls]   <= LD_WAIT;
                 end else if (alloc_ls) begin
-                    lsu_valid[ls]   <= 1'b1;
-                    lsu_tag[ls]     <= rob_tail;
-                    lsu_pc[ls]      <= IF_ID_PC;
-                    lsu_rd[ls]      <= r_rd;
-                    lsu_is_load[ls] <= r_dmem_ren;
-                    lsu_imm[ls]     <= r_immediate;
-                    lsu_memb[ls]    <= r_dmem_memb;
-                    lsu_memh[ls]    <= r_dmem_memh;
-                    lsu_memw[ls]    <= r_dmem_memw;
-                    lsu_memu[ls]    <= r_dmem_memu;
-                    lsu_op1_val[ls] <= iss_op1_val;
-                    lsu_q1_v[ls]    <= iss_op1_qv;
-                    lsu_q1_t[ls]    <= iss_op1_qt;
-                    lsu_op2_val[ls] <= iss_op2_val;
-                    lsu_q2_v[ls]    <= iss_op2_qv;
-                    lsu_q2_t[ls]    <= iss_op2_qt;
-                    lsu_st_prep[ls] <= 1'b0;
-                end else if (pop_ls) begin
-                    lsu_valid[ls]   <= 1'b0;
-                    lsu_st_prep[ls] <= 1'b0;
+                    lsu_valid[ls]       <= 1'b1;
+                    lsu_tag[ls]         <= rob_tail;
+                    lsu_pc[ls]          <= IF_ID_PC;
+                    lsu_rd[ls]          <= r_rd;
+                    lsu_is_load[ls]     <= r_dmem_ren;
+                    lsu_imm[ls]         <= r_immediate;
+                    lsu_memb[ls]        <= r_dmem_memb;
+                    lsu_memh[ls]        <= r_dmem_memh;
+                    lsu_memw[ls]        <= r_dmem_memw;
+                    lsu_memu[ls]        <= r_dmem_memu;
+                    lsu_op1_val[ls]     <= iss_op1_val;
+                    lsu_q1_v[ls]        <= iss_op1_qv;
+                    lsu_q1_t[ls]        <= iss_op1_qt;
+                    lsu_op2_val[ls]     <= iss_op2_val;
+                    lsu_q2_v[ls]        <= iss_op2_qv;
+                    lsu_q2_t[ls]        <= iss_op2_qt;
+                    lsu_st_prepped[ls]  <= 1'b0;
+                    lsu_ld_state[ls]    <= LD_WAIT;
                 end else if (lsu_valid[ls]) begin
-                    if (prep_ls)
-                        lsu_st_prep[ls] <= 1'b1;
+                    if (prep_ls) begin
+                        lsu_st_prepped[ls] <= 1'b1;
+                        lsu_st_baddr[ls]   <= lsu_eff_addr[ls];
+                        lsu_st_mask[ls]    <= lsu_misal_c[ls] ? 4'd0 : lsu_mask_c[ls];
+                        lsu_st_wdata[ls]   <= lsu_wdata_c[ls];
+                    end
+
+                    if (ld_trap_ls) begin
+                        lsu_ld_state[ls] <= LD_DONE;
+                    end else if (ld_fwd_ls) begin
+                        lsu_ld_state[ls] <= LD_CDB;
+                        lsu_ld_val[ls]   <= lsu_ld_fwd_ext[ls];
+                        lsu_ld_raw[ls]   <= lsu_ld_fwd_raw[ls];
+                        lsu_ld_waddr[ls] <= lsu_waddr_c[ls];
+                        lsu_ld_mask[ls]  <= lsu_mask_c[ls];
+                    end else if (ld_dc_hit_ls) begin
+                        lsu_ld_state[ls] <= LD_CDB;
+                        lsu_ld_val[ls]   <= dc_hit_ext;
+                        lsu_ld_raw[ls]   <= dcache_rdata;
+                        lsu_ld_waddr[ls] <= lsu_waddr_c[ls];
+                        lsu_ld_mask[ls]  <= lsu_mask_c[ls];
+                    end else if (ld_dc_mis_ls) begin
+                        lsu_ld_state[ls]    <= LD_MISS;
+                        lsu_ld_waddr[ls]    <= lsu_waddr_c[ls];
+                        lsu_ld_mask[ls]     <= lsu_mask_c[ls];
+                        lsu_ld_blk_addr[ls] <= lsu_blk_addr_c[ls];
+                        lsu_ld_byte_off[ls] <= lsu_boff_c[ls];
+                    end else if (ld_fill_ls) begin
+                        lsu_ld_state[ls] <= LD_CDB;
+                        lsu_ld_val[ls]   <= lsu_ld_fill_ext[ls];
+                        lsu_ld_raw[ls]   <= lsu_ld_fill_raw[ls];
+                    end else if (ld_gnt_ls) begin
+                        lsu_ld_state[ls] <= LD_DONE;
+                    end
 
                     if (cdb_valid && lsu_q1_v[ls] && (lsu_q1_t[ls] == cdb_tag)) begin
                         lsu_op1_val[ls] <= cdb_val;

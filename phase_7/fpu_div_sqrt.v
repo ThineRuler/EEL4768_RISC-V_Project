@@ -70,17 +70,49 @@ module fpu_div_sqrt (
     reg [51:0] radicand;
     reg [28:0] sqrt_rem;
 
-    // One restoring division bit per cycle.
-    wire [24:0] div_shifted = {div_rem[23:0], 1'b0};
-    wire div_bit = (div_shifted >= {1'b0, divisor});
-    wire [24:0] div_next = div_bit ? div_shifted - {1'b0, divisor} : div_shifted;
+    // Four restoring division bits per cycle when remaining >= 4, else 1 bit.
+    wire [24:0] div_sh0  = {div_rem[23:0], 1'b0};
+    wire        div_b0   = (div_sh0 >= {1'b0, divisor});
+    wire [24:0] div_r0   = div_b0 ? (div_sh0 - {1'b0, divisor}) : div_sh0;
 
-    // Bring down two radicand bits. If the trial fits, subtract and
-    // append a 1 to the partial root; otherwise append a 0.
-    wire [28:0] sqrt_shifted = {sqrt_rem[26:0], radicand[51:50]};
-    wire [28:0] sqrt_trial = {1'b0, digits, 2'b01};
-    wire sqrt_bit = (sqrt_shifted >= sqrt_trial);
-    wire [28:0] sqrt_next = sqrt_bit ? sqrt_shifted - sqrt_trial : sqrt_shifted;
+    wire [24:0] div_sh1  = {div_r0[23:0], 1'b0};
+    wire        div_b1   = (div_sh1 >= {1'b0, divisor});
+    wire [24:0] div_r1   = div_b1 ? (div_sh1 - {1'b0, divisor}) : div_sh1;
+
+    wire [24:0] div_sh2  = {div_r1[23:0], 1'b0};
+    wire        div_b2   = (div_sh2 >= {1'b0, divisor});
+    wire [24:0] div_r2   = div_b2 ? (div_sh2 - {1'b0, divisor}) : div_sh2;
+
+    wire [24:0] div_sh3  = {div_r2[23:0], 1'b0};
+    wire        div_b3   = (div_sh3 >= {1'b0, divisor});
+    wire [24:0] div_r3   = div_b3 ? (div_sh3 - {1'b0, divisor}) : div_sh3;
+
+    // Four square-root bits per cycle when remaining >= 4, else 1 bit.
+    wire [28:0] sq_sh0   = {sqrt_rem[26:0], radicand[51:50]};
+    wire [28:0] sq_tr0   = {1'b0, digits, 2'b01};
+    wire        sq_b0    = (sq_sh0 >= sq_tr0);
+    wire [28:0] sq_r0    = sq_b0 ? (sq_sh0 - sq_tr0) : sq_sh0;
+    wire [25:0] sq_d0    = {digits[24:0], sq_b0};
+
+    wire [28:0] sq_sh1   = {sq_r0[26:0], radicand[49:48]};
+    wire [28:0] sq_tr1   = {1'b0, sq_d0, 2'b01};
+    wire        sq_b1    = (sq_sh1 >= sq_tr1);
+    wire [28:0] sq_r1    = sq_b1 ? (sq_sh1 - sq_tr1) : sq_sh1;
+    wire [25:0] sq_d1    = {sq_d0[24:0], sq_b1};
+
+    wire [28:0] sq_sh2   = {sq_r1[26:0], radicand[47:46]};
+    wire [28:0] sq_tr2   = {1'b0, sq_d1, 2'b01};
+    wire        sq_b2    = (sq_sh2 >= sq_tr2);
+    wire [28:0] sq_r2    = sq_b2 ? (sq_sh2 - sq_tr2) : sq_sh2;
+    wire [25:0] sq_d2    = {sq_d1[24:0], sq_b2};
+
+    wire [28:0] sq_sh3   = {sq_r2[26:0], radicand[45:44]};
+    wire [28:0] sq_tr3   = {1'b0, sq_d2, 2'b01};
+    wire        sq_b3    = (sq_sh3 >= sq_tr3);
+    wire [28:0] sq_r3    = sq_b3 ? (sq_sh3 - sq_tr3) : sq_sh3;
+    wire [25:0] sq_d3    = {sq_d2[24:0], sq_b3};
+
+    wire do_quad = (remaining >= 5'd4);
 
     assign o_busy = i_valid && ((state == RUN) || ((state == IDLE) && !special));
 
@@ -110,16 +142,29 @@ module fpu_div_sqrt (
             radicand <= sqrt_input;
             sqrt_rem <= 29'd0;
         end else if (state == RUN) begin
-            digits <= {digits[24:0], (run_sqrt ? sqrt_bit : div_bit)};
-            if (run_sqrt) begin
-                radicand <= {radicand[49:0], 2'b00};
-                sqrt_rem <= sqrt_next;
+            if (do_quad) begin
+                digits <= run_sqrt ? sq_d3 : {digits[21:0], div_b0, div_b1, div_b2, div_b3};
+                if (run_sqrt) begin
+                    radicand <= {radicand[43:0], 8'b0};
+                    sqrt_rem <= sq_r3;
+                end else begin
+                    div_rem <= div_r3;
+                end
+                remaining <= remaining - 5'd4;
+                if (remaining == 5'd4)
+                    state <= DONE;
             end else begin
-                div_rem <= div_next;
+                digits <= run_sqrt ? sq_d0 : {digits[24:0], div_b0};
+                if (run_sqrt) begin
+                    radicand <= {radicand[49:0], 2'b00};
+                    sqrt_rem <= sq_r0;
+                end else begin
+                    div_rem <= div_r0;
+                end
+                remaining <= remaining - 5'd1;
+                if (remaining == 5'd1)
+                    state <= DONE;
             end
-            remaining <= remaining - 5'd1;
-            if (remaining == 5'd1)
-                state <= DONE;
         end else if ((state == DONE) && i_advance) begin
             state <= IDLE;
         end

@@ -178,7 +178,6 @@ module hart_p6_tb;
                 dmem_q_addr[dmem_q_tail]  <= mem_rd_addr;
                 dmem_q_timer[dmem_q_tail] <= LATENCY;
                 dmem_q_tail  <= (dmem_q_tail + 1) % 16;
-                dmem_q_count <= dmem_q_count + 1;
             end
 
             for (i = 0; i < 16; i = i + 1) begin
@@ -196,8 +195,8 @@ module hart_p6_tb;
                 end
                 mem_valid    <= 1;
                 dmem_q_head  <= (dmem_q_head + 1) % 16;
-                dmem_q_count <= dmem_q_count - 1;
             end
+            dmem_q_count <= dmem_q_count + (mem_rd ? 1 : 0) - ((dmem_q_count > 0 && dmem_q_timer[dmem_q_head] <= 1) ? 1 : 0);
         end
     end
 
